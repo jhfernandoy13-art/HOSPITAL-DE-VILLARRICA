@@ -23,6 +23,9 @@ import streamlit as st
 
 st.set_page_config(page_title="Fármacos e insumos: estado y demanda", page_icon="💊", layout="wide")
 
+# ----------------------------------------------------------------------------
+# Catálogo maestro semilla (685 fármacos, ZGEN e historia ENE-MAY 2026)
+# ----------------------------------------------------------------------------
 ARSENAL_SEED_B64 = (
     "/Td6WFoAAATm1rRGAgAhARwAAAAQz1jM4SBuUQJdADIYSu+yI2OKDiII6suHZwzGZUBIcJVhsoOxrmLkOm4wTy97ToNm5nz6DOwqeAhw8qg0oL7weKmBee6t"
     "l6DQEjsJRmkOYGPlzlNnTAexClYgXR050w0UcQqbrCDljXLdG43JJPQ8sIzOtetd6AGPyYhwJTtVliV0AogozMYvSifBUvMqg/M+o5QOs0gBzU4teJxT+9xo"
@@ -1113,8 +1116,8 @@ def flags_precio_atipico(df: pd.DataFrame):
         for i in idx:
             otros = p.drop(i)
             otros = otros[otros > 0]
-            if len(otros) >= 2 and p[i] > 100000 and p[i] > 15 * outros.median():
-                out[i] = True
+            if len(otros) >= 2 and p[i] > 100000 and p[i] > 15 * otros.median():
+                out.loc[i] = True
     return out
 
 
@@ -1530,7 +1533,7 @@ def render_insumos(stock_file, salidas_files, licit, u_cr, u_ss, horiz_m, dias_s
     with sub1:
         cnt = v["estado"].value_counts().reindex(["QS", "CR", "OK", "SS", "SM", "IN"]).fillna(0).astype(int)
         total_act = int(cnt[["QS", "CR", "OK", "SS", "SM"]].sum())
-        desc_estado = {"QS": "sin stock y con consumo", "CR": f"menos de {u_cr} days",
+        desc_estado = {"QS": "sin stock y con consumo", "CR": f"menos de {u_cr} días",
                        "OK": f"{u_cr} a {u_ss - 1} días", "SS": f"{u_ss} días o más"}
         cols = st.columns(4)
         for col, e in zip(cols, ["QS", "CR", "OK", "SS"]):
@@ -1788,7 +1791,7 @@ def render_insumos(stock_file, salidas_files, licit, u_cr, u_ss, horiz_m, dias_s
                                      name="Rango probable (80 %)", hoverinfo="skip"))
             fig.add_trace(go.Scatter(x=hx, y=R["Y"][i], mode="lines+markers", name="Consumo real",
                                      line=dict(color="#2E7D5B", width=3)))
-            fig.add_trace(go.Scatter(x=[hx[-1]] + fx, y=[Y[i][-1]] + list(fy), mode="lines+markers",
+            fig.add_trace(go.Scatter(x=[hx[-1]] + fx, y=[R["Y"][i][-1]] + list(fy), mode="lines+markers",
                                      name="Proyección", line=dict(color="#3B6EA8", width=3, dash="dash")))
             fig.update_layout(height=340, margin=dict(t=20, b=10, l=10, r=10), yaxis_title="Unidades por mes",
                               legend=dict(orientation="h", y=-0.2), hovermode="x unified")
@@ -1875,7 +1878,7 @@ def render_insumos(stock_file, salidas_files, licit, u_cr, u_ss, horiz_m, dias_s
         st.dataframe(rev[["producto", "motivo", "precio_arch", "pu_mov", "stock", "cons_valor"]], hide_index=True,
                      column_config={"producto": "Insumo", "motivo": "Motivo",
                                     "precio_arch": st.column_config.NumberColumn("Precio en stock ($)", format="%.0f"),
-                                    "pu_mov": st.column_config.NumberColumn("Precio en salidas ($)", format="%.0f"),
+                                    "pu_mov": st.column_config.NumberColumn("Precio in salidas ($)", format="%.0f"),
                                     "stock": st.column_config.NumberColumn("Stock", format="%.0f"),
                                     "cons_valor": st.column_config.NumberColumn("Consumo ($)", format="%.0f")})
         st.markdown(
@@ -1895,7 +1898,7 @@ def render_insumos(stock_file, salidas_files, licit, u_cr, u_ss, horiz_m, dias_s
             try:
                 vl, meta_v = load_vencimientos(venc_file[1])
             except Exception as exc:
-                st.error(f"No pude leer el reporte de vencimientos: {exc}")
+                st.error(f"No pude leer el vencimientos: {exc}")
             else:
                 ref_v = pd.Timestamp(meta_v["fecha"] or date.today())
                 lots_i = riesgo_fefo(vl[vl["codigo"].isin(set(ins["codigo"]))],
@@ -1988,7 +1991,7 @@ with st.sidebar:
     rot_opts = [r for r in ROT_ORDEN if r in set(ars["ROTACION"].dropna().astype(str))]
     rot_sel = st.multiselect("Rotación", rot_opts, default=rot_opts)
     cen_opts = sorted(set(ars["ESTADO CENABAST"].fillna("Sin Cenabast").astype(str)))
-    cen_sel = st.multiselect("Estado Cenabast", cen_opts, default=cen_opts)
+    cen_sel = st.multiselect("Excel Cenabast", cen_opts, default=cen_opts)
     texto = st.text_input("Buscar fármaco o código")
 
     with st.expander("Parámetros de proyección y compra", expanded=False):
@@ -2575,7 +2578,7 @@ with tab4:
         v["tasa"] = v["Código"].map(tasa).fillna(0)
         v["consumible"] = v["tasa"] * v["dias"].clip(lower=0)
         v["en_riesgo"] = np.ceil(np.clip(v["Cantidad"] - v["consumible"], 0, None))
-        v["valor_riesgo"] = v["en_riesgo"] * v["Precio Lote"]
+        v["vencimiento_val"] = v["en_riesgo"] * v["Precio Lote"]
         v["situacion"] = np.where(v["dias"] < 0, "Vencido",
                                   np.where(v["en_riesgo"] > 0, "En riesgo de pérdida", "Se alcanza a consumir"))
         e1, e2, e3 = st.columns(3)
@@ -2585,17 +2588,17 @@ with tab4:
             kpi("Lotes en riesgo de pérdida", n0((v["situacion"] != "Se alcanza a consumir").sum()),
                 "Vencidos o que no alcanzan a consumirse", "#B3261E")
         with e3:
-            kpi("Valor en riesgo", clp(v["valor_riesgo"].sum()), "Unidades que no se consumirían a tiempo", "#B3261E")
+            kpi("Valor en riesgo", clp(v["vencimiento_val"].sum()), "Unidades que no se consumirían a tiempo", "#B3261E")
         st.dataframe(
             v.sort_values("dias")[["Bodega", "Producto", "Lote", "Fecha Vencimiento", "dias", "Cantidad",
-                                   "consumible", "en_riesgo", "valor_riesgo", "situacion"]],
+                                   "consumible", "en_riesgo", "vencimiento_val", "situacion"]],
             hide_index=True,
             column_config={
                 "Fecha Vencimiento": st.column_config.DateColumn("Vence", format="DD/MM/YYYY"),
                 "dias": st.column_config.NumberColumn("Días restantes", format="%.0f"),
                 "consumible": st.column_config.NumberColumn("Se consumiría", format="%.0f"),
                 "en_riesgo": st.column_config.NumberColumn("En riesgo (unidades)", format="%.0f"),
-                "valor_riesgo": st.column_config.NumberColumn("Valor en riesgo ($)", format="%.0f"),
+                "vencimiento_val": st.column_config.NumberColumn("Valor en riesgo ($)", format="%.0f"),
                 "situacion": "Situación"})
 
     st.subheader("Vencimientos de los fármacos de mayor demanda")
