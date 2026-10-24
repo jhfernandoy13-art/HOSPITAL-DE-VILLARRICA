@@ -944,4 +944,1676 @@ def f_ses(y, h, a=0.5):
     return np.full(h, lvl)
 
 
-def f_holt(y
+def f_holt(y, h, a=0.5, b=0.2, phi=0.9):
+    k = min(2, len(y) - 1)
+    lvl, tr = y[0], (y[k] - y[0]) / max(k, 1)
+    for v in y[1:]:
+        prev = lvl
+        lvl = a * v + (1 - a) * (prev + phi * tr)
+        tr = b * (lvl - prev) + (1 - b) * phi * tr
+    return lvl + np.cumsum(phi ** np.arange(1, h + 1)) * tr
+
+
+def f_lin(y, h):
+    x = np.arange(len(y))
+    slope, inter = np.polyfit(x, y, 1)
+    f = inter + slope * np.arange(len(y), len(y) + h)
+    return np.clip(f, 0, 1.5 * y.max())
+
+
+FUNCS = {
+    "Promedio 3 meses": f_pm3,
+    "Promedio histórico": f_mean,
+    "Suavizamiento exponencial": f_ses,
+    "Holt amortiguado": f_holt,
+    "Tendencia lineal": f_lin,
+}
+MODEL_NAMES = list(FUNCS)
+
+
+@st.cache_data(show_spinner="Calculando proyecciones por fármaco…")
+def run_forecast(Y: np.ndarray, months: tuple, h: int):
+    days = np.array([calendar.monthrange(y, m)[1] for y, m in months], dtype=float)
+    R = Y / days
+    n, T = R.shape
+    M = len(FUNCS)
+    F = np.zeros((n, h))
+    SIG = np.zeros((n, h))
+    best = np.empty(n, dtype=object)
+    wape = np.full(n, np.nan)
+    wape_m = np.full((n, M), np.nan)
+    fns = list(FUNCS.values())
+    for i in range(n):
+        y = R[i]
+        if y.sum() <= 0:
+            best[i] = "Sin consumo"
+            continue
+        abs_e = np.zeros(M)
+        sq_e = np.zeros(M)
+        k = 0
+        for t in range(MIN_TRAIN, T):
+            tr = y[:t]
+            for j, fn in enumerate(fns):
+                e = max(fn(tr, 1)[0], 0.0) - y[t]
+                abs_e[j] += abs(e)
+                sq_e[j] += e * e
+            k += 1
+        j = int(np.argmin(np.round(abs_e, 9)))
+        test_sum = y[MIN_TRAIN:].sum()
+        if test_sum > 0:
+            wape_m[i] = abs_e / test_sum
+            wape[i] = wape_m[i, j]
+        rmse = np.sqrt(sq_e[j] / max(k, 1))
+        F[i] = np.clip(fns[j](y, h), 0, None)
+        SIG[i] = rmse * np.sqrt(np.arange(1, h + 1))
+        best[i] = MODEL_NAMES[j]
+    return {"F": F, "SIG": SIG, "best": best, "wape": wape, "wape_m": wape_m, "days": days}
+
+
+def demanda_diaria(F, fc_months, start, n_days):
+    base = fc_months[0][0] * 12 + fc_months[0][1]
+    idx = np.empty(n_days, dtype=int)
+    for i in range(n_days):
+        d = start + timedelta(days=i)
+        idx[i] = min(max(d.year * 12 + d.month - base, 0), F.shape[1] - 1)
+    return F[:, idx]
+
+
+def dias_hasta_quiebre(C, D, avail):
+    n = len(avail)
+    out = np.full(n, np.inf)
+    hit = C >= avail[:, None]
+    anyhit = hit.any(axis=1)
+    k = hit.argmax(axis=1)
+    rows = np.arange(n)
+    prev = C[rows, k] - D[rows, k]
+    frac = np.divide(avail - prev, D[rows, k], out=np.zeros(n), where=D[rows, k] > 0)
+    out[anyhit] = (k + frac)[anyhit]
+    out[avail <= 0] = 0.0
+    out[D.sum(axis=1) <= 0] = np.inf
+    return out
+
+
+N_DIAS_PROY = 730
+
+
+@st.cache_data(show_spinner="Leyendo stock de insumos…")
+def load_stock_ins(file_bytes: bytes):
+    texto, d = leer_con_encabezado(file_bytes)
+    d = d.rename(columns={"Código": "codigo", "Producto": "producto", "Unidad Medida": "unidad",
+                          "Cantidad": "stock", "Precio": "precio", "Total": "valor_stock"})
+    for c in ["stock", "precio", "valor_stock"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce") if c in d.columns else np.nan
+    if "unidad" not in d.columns:
+        d["unidad"] = ""
+    d["codigo"] = d["codigo"].astype(str).str.strip()
+    d["producto"] = d["producto"].astype(str).str.strip()
+    d["unidad"] = d["unidad"].fillna("").astype(str)
+    d["stock"] = d["stock"].fillna(0)
+    d["valor_stock"] = d["valor_stock"].fillna(d["stock"] * d["precio"].fillna(0))
+    d = d.groupby("codigo", as_index=False).agg(
+        producto=("producto", "first"), unidad=("unidad", "first"), stock=("stock", "sum"),
+        precio=("precio", "mean"), valor_stock=("valor_stock", "sum"))
+    m = re.search(r"para el d[ií]a\s*(\d{1,2})/(\d{1,2})/(\d{4})", texto)
+    fecha = _fecha_dmy(m.group(1), m.group(2), m.group(3)) if m else None
+    bodega = re.sub(r"^\s*Stock\s+en\s+", "", texto.split("Obtenido")[0]).strip()
+    return d, {"fecha": fecha, "bodega": bodega}
+
+
+@st.cache_data(show_spinner="Leyendo salidas de insumos…")
+def load_salidas(files: tuple):
+    partes, bloques, bodega = [], [], ""
+    for k, fb in enumerate(files):
+        texto, d = leer_con_encabezado(fb)
+        d = d.rename(columns={"Código": "codigo", "Producto": "producto", "Unidad Medida": "unidad",
+                              "cantidad": "cantidad", "Cantidad": "cantidad", "Total": "total",
+                              "Tipo Movimiento": "tipo_mov", "Tipo Documento": "tipo_doc",
+                              "Bodega Origen": "origen", "Bodega Destino": "destino"})
+        for c in ["unidad", "tipo_mov", "tipo_doc", "origen", "destino"]:
+            if c not in d.columns:
+                d[c] = ""
+            d[c] = d[c].fillna("").astype(str)
+        d["codigo"] = d["codigo"].astype(str).str.strip()
+        d["producto"] = d["producto"].astype(str).str.strip()
+        d["cantidad"] = pd.to_numeric(d["cantidad"], errors="coerce").fillna(0)
+        d["total"] = pd.to_numeric(d["total"], errors="coerce").fillna(0)
+        m = re.search(r"desde\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*hasta\s*(\d{1,2})/(\d{1,2})/(\d{4})", texto)
+        desde = _fecha_dmy(*m.group(1, 2, 3)) if m else None
+        hasta = _fecha_dmy(*m.group(4, 5, 6)) if m else None
+        fcol = next((c for c in d.columns if "fecha" in str(c).lower()), None)
+        if fcol is not None:
+            f = pd.to_datetime(d[fcol], errors="coerce", dayfirst=True)
+            d["ym"] = f.dt.year * 12 + f.dt.month - 1
+            if (desde is None or hasta is None) and f.notna().any():
+                desde, hasta = f.min().date(), f.max().date()
+        elif desde and hasta and (desde.year, desde.month) == (hasta.year, hasta.month):
+            d["ym"] = float(desde.year * 12 + desde.month - 1)
+        else:
+            d["ym"] = np.nan
+        d["bloque"] = k
+        partes.append(d[["codigo", "producto", "unidad", "cantidad", "total", "tipo_mov", "tipo_doc",
+                         "origen", "destino", "ym", "bloque"]])
+        bloques.append((desde, hasta))
+        if not bodega:
+            bodega = re.sub(r"^\s*Movimientos\s+en\s+", "", texto.split("Obtenido")[0]).strip()
+    mov = pd.concat(partes, ignore_index=True)
+    dias = sum((h - d_).days + 1 for d_, h in bloques if d_ and h)
+    return mov, {"bloques": bloques, "dias": int(dias), "bodega": bodega}
+
+
+@st.cache_data(show_spinner=False)
+def flags_precio_atipico(df: pd.DataFrame):
+    k = (df["producto"].str.upper().str.replace(r"[^A-Z0-9 ]", " ", regex=True)
+         .str.split().str[:2].str.join(" "))
+    out = pd.Series(False, index=df.index)
+    for _, idx in df.groupby(k).groups.items():
+        if len(idx) < 3:
+            continue
+        p = df.loc[idx, "precio"]
+        for i in idx:
+            otros = p.drop(i)
+            otros = otros[otros > 0]
+            if len(otros) >= 2 and p[i] > 100000 and p[i] > 15 * outros.median():
+                out[i] = True
+    return out
+
+
+def construir_serie(cons, bloques, codigos):
+    if cons.empty or cons["ym"].isna().any() or not bloques:
+        return None
+    cov = {}
+    for desde, hasta in bloques:
+        if desde is None or hasta is None:
+            return None
+        d = desde
+        while d <= hasta:
+            key = d.year * 12 + d.month - 1
+            cov[key] = cov.get(key, 0) + 1
+            d += timedelta(days=1)
+    dim = {k: calendar.monthrange(k // 12, k % 12 + 1)[1] for k in cov}
+    usables = sorted(k for k in cov if cov[k] >= 0.8 * dim[k])
+    if not usables:
+        return None
+    run = [usables[-1]]
+    for k in reversed(usables[:-1]):
+        if k == run[-1] - 1:
+            run.append(k)
+        else:
+            break
+    run = sorted(run)
+    if len(run) < MIN_TRAIN + 1:
+        return None
+    piv = cons.groupby(["codigo", "ym"])["cantidad"].sum().unstack(fill_value=0)
+    piv.columns = [int(c) for c in piv.columns]
+    Y = np.zeros((len(codigos), len(run)))
+    for j, k in enumerate(run):
+        if k in piv.columns:
+            s = piv[k].reindex(codigos).fillna(0).to_numpy(float)
+            Y[:, j] = s / min(cov[k], dim[k]) * dim[k]
+    months = tuple((k // 12, k % 12 + 1) for k in run)
+    return months, Y
+
+
+def calcular_insumos(stock, mov, meta_m, tipos_sel, dias_per, fecha_stock, u_cr, u_ss, horiz_m, dias_seg):
+    sal = mov[mov["tipo_mov"].str.upper().str.contains("SALIDA", na=False)]
+    cons = sal[sal["tipo_doc"].isin(tipos_sel)]
+    g = cons.groupby("codigo").agg(cons_cant=("cantidad", "sum"), cons_valor=("total", "sum"),
+                                   n_mov=("cantidad", "size"))
+    nombres = sal.drop_duplicates("codigo").set_index("codigo")[["producto", "unidad"]]
+    ins = stock.set_index("codigo")
+    extra = nombres.loc[~nombres.index.isin(ins.index)]
+    if len(extra):
+        extra = extra.assign(stock=0.0, precio=np.nan, valor_stock=0.0)
+        ins = pd.concat([ins, extra])
+    ins.index.name = "codigo"
+    ins = ins.join(g)
+    for c in ["cons_cant", "cons_valor", "n_mov"]:
+        ins[c] = ins[c].fillna(0)
+    tot_c = sal.groupby("codigo")["total"].sum()
+    tot_q = sal.groupby("codigo")["cantidad"].sum()
+    ins["pu_mov"] = (tot_c / tot_q.replace(0, np.nan)).reindex(ins.index)
+    ins["precio_arch"] = ins["precio"]
+    ins["precio"] = ins["precio"].where(ins["precio"] > 0, ins["pu_mov"])
+    ins = ins.reset_index()
+
+    ins["tasa_dia"] = ins["cons_cant"] / max(dias_per, 1)
+    ins["aut_dias"] = np.where(ins["tasa_dia"] > 0, ins["stock"] / ins["tasa_dia"].replace(0, np.nan), np.nan)
+    ins["estado"] = np.select(
+        [(ins["tasa_dia"] <= 0) & (ins["stock"] > 0), ins["tasa_dia"] <= 0, ins["stock"] <= 0,
+         ins["aut_dias"] < u_cr, ins["aut_dias"] < u_ss],
+        ["SM", "IN", "QS", "CR", "OK"], "SS")
+    ins["regularidad"] = np.select(
+        [ins["n_mov"] >= 6, ins["n_mov"] >= 3, ins["n_mov"] >= 1],
+        ["Regular (6 o más)", "Ocasional (3 a 5)", "Esporádico (1 o 2)"], "Sin consumo")
+
+    ins["precio_atipico"] = flags_precio_atipico(ins[["producto", "precio"]]).to_numpy()
+    r = ins["pu_mov"] / ins["precio_arch"]
+    ins["precio_cero"] = ins["precio_arch"].fillna(0) <= 0
+    ins["precio_difiere"] = (ins["precio_arch"] > 0) & ((r > 3) | (r < 1 / 3))
+    ins["precio_sospechoso"] = ins["precio_atipico"] | ins["precio_cero"] | ins["precio_difiere"]
+
+    cods = list(ins["codigo"])
+    serie = construir_serie(cons, meta_m["bloques"], cods)
+    H = HORIZONTE_FC
+    hastas = [h for _, h in meta_m["bloques"] if h]
+    corte = max(hastas) if hastas else fecha_stock
+    if serie is not None:
+        months, Y = serie
+        fc = run_forecast(Y, months, H)
+        F, SIG = fc["F"], fc["SIG"]
+        ins["modelo"] = fc["best"]
+        ins["wape"] = fc["wape"]
+        ins["confianza"] = np.select(
+            [ins["modelo"] == "Sin consumo", ins["wape"].isna(), ins["wape"] < 0.15, ins["wape"] < 0.35],
+            ["Sin consumo", "s/d", "Alta", "Media"], "Baja")
+        ym_ = months[-1]
+        modo = "mensual"
+    else:
+        months, Y = None, None
+        F = np.repeat(ins["tasa_dia"].to_numpy(float)[:, None], H, axis=1)
+        SIG = np.zeros_like(F)
+        ins["modelo"] = np.where(ins["tasa_dia"] > 0, "Promedio del período", "Sin consumo")
+        ins["wape"] = np.nan
+        ins["confianza"] = np.where(ins["tasa_dia"] > 0, "Constante", "Sin consumo")
+        ym_ = (corte.year, corte.month)
+        modo = "constante"
+    fcm = []
+    for _ in range(H):
+        ym_ = next_month(ym_)
+        fcm.append(ym_)
+    D = demanda_diaria(F, fcm, fecha_stock, N_DIAS_PROY)
+    C = np.cumsum(D, axis=1)
+    hd = int(round(horiz_m * 30.4375))
+    avail = ins["stock"].to_numpy(float)
+    dem_h = C[:, hd - 1]
+    ins["demanda_h"] = dem_h
+    ins["compra"] = np.ceil(np.clip(dem_h + dem_h / hd * dias_seg - avail, 0, None))
+    ins["compra_valor"] = ins["compra"] * ins["precio"]
+    q = dias_hasta_quiebre(C, D, avail)
+    ins["quiebre_dias"] = q
+    ins["quiebre_fecha"] = pd.NaT
+    fin = np.isfinite(q)
+    ins.loc[fin, "quiebre_fecha"] = pd.Timestamp(fecha_stock) + pd.to_timedelta(q[fin], unit="D")
+    ins["estado_icon"] = ins["estado"].map(ESTADO_ICON)
+    ins["tasa_fc_dia"] = F[:, :3].mean(axis=1)
+    return {"ins": ins, "sal": sal, "cons": cons, "F": F, "SIG": SIG, "fcm": fcm, "C": C, "modo": modo,
+            "months": months, "Y": Y, "hd": hd, "corte": corte}
+
+
+def limpiar_servicio(s):
+    return re.sub(r"^.*?HOSP\.,\s*", "", str(s)).strip().title()
+
+
+SIT_COLOR = {"Vencido en bodega activa": "#B3261E", "En riesgo de pérdida": "#E8890C",
+             "Se alcanza a consumir": "#2E7D5B", "En cuarentena": "#8A8A8A"}
+
+
+@st.cache_data(show_spinner="Leyendo vencimientos…")
+def load_vencimientos(file_bytes: bytes):
+    texto, d = leer_con_encabezado(file_bytes, clave="Establecimiento")
+    d = d.rename(columns={"Bodega": "bodega", "Código": "codigo", "Producto": "producto", "Lote": "lote",
+                          "Fecha Vencimiento": "vence", "Cantidad": "cantidad",
+                          "Precio Lote": "precio_lote", "Total": "total"})
+    for c in ["cantidad", "precio_lote", "total"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+    for c in ["codigo", "producto", "lote", "bodega"]:
+        d[c] = d[c].fillna("").astype(str).str.strip()
+    v = pd.to_datetime(d["vence"], format="%d/%m/%Y", errors="coerce")
+    falta = v.isna()
+    if falta.any():
+        v[falta] = pd.to_datetime(d.loc[falta, "vence"], errors="coerce")
+    d["vence"] = v
+    d = d.dropna(subset=["vence"])[["bodega", "codigo", "producto", "lote", "vence", "cantidad",
+                                    "precio_lote", "total"]].reset_index(drop=True)
+    m = re.search(r"Obtenido\s*:\s*(\d{1,2})/(\d{1,2})/(\d{4})", texto)
+    f = re.search(r"Filtro:\s*(.*)$", texto)
+    return d, {"fecha": _fecha_dmy(*m.groups()) if m else None, "filtro": f.group(1).strip() if f else ""}
+
+
+def riesgo_fefo(lots, tasa_map, ref):
+    L = lots.sort_values(["codigo", "vence"]).reset_index(drop=True)
+    cuar = L["bodega"].str.upper().str.contains("CUARENTENA", na=False).to_numpy()
+    cod = L["codigo"].to_numpy()
+    cant = L["cantidad"].to_numpy(float)
+    dias = (L["vence"] - ref).dt.days.to_numpy(float)
+    t = np.clip(dias, 0, None)
+    rate = L["codigo"].map(tasa_map).fillna(0).to_numpy(float)
+    riesgo = np.zeros(len(L))
+    prev, usado = None, 0.0
+    for k in range(len(L)):
+        if cod[k] != prev:
+            prev, usado = cod[k], 0.0
+        if cuar[k]:
+            riesgo[k] = cant[k]
+            continue
+        c = min(cant[k], max(0.0, rate[k] * t[k] - usado))
+        usado += c
+        riesgo[k] = cant[k] - c
+    L["dias"] = dias.astype(int)
+    L["en_riesgo"] = riesgo
+    L["valor_riesgo"] = riesgo * L["precio_lote"]
+    L["situacion"] = np.select([cuar, dias < 0, riesgo > 0],
+                               ["En cuarentena", "Vencido en bodega activa", "En riesgo de pérdida"],
+                               "Se alcanza a consumir")
+    L["bodega_corta"] = L["bodega"].str.replace(r"^BODEGA\s+", "", regex=True).str.replace(r"\s+HV$", "", regex=True)
+    return L
+
+
+def _resumen_lotes(lr, base):
+    lt = lr[lr["codigo"].isin(set(base["codigo"]))]
+    act = lt[lt["situacion"] != "En cuarentena"]
+    ag = lt.groupby("codigo").agg(
+        lotes=("lote", "size"), unidades=("cantidad", "sum"), en_riesgo=("en_riesgo", "sum"),
+        valor_riesgo=("valor_riesgo", "sum"),
+        vencidos=("situacion", lambda s: int((s == "Vencido en bodega activa").sum())),
+        cuarentena=("situacion", lambda s: int((s == "En cuarentena").sum())))
+    ag["primer_venc"] = act.groupby("codigo")["vence"].min()
+    ag["dias_primero"] = act.groupby("codigo")["dias"].min()
+    ag["en_riesgo_activo"] = act[act["situacion"] == "En riesgo de pérdida"].groupby("codigo")["en_riesgo"].sum()
+    t = base.merge(ag, left_on="codigo", right_index=True, how="left")
+    for c in ["lotes", "unidades", "en_riesgo", "valor_riesgo", "vencidos", "cuarentena", "en_riesgo_activo"]:
+        t[c] = t[c].fillna(0)
+    t["activos"] = t["lotes"] - t["cuarentena"]
+    t["alerta"] = np.select(
+        [t["vencidos"] > 0, t["en_riesgo_activo"] > 0, t["activos"] > 0, t["lotes"] > 0],
+        ["🔴 Vencido en bodega activa", "🟠 En riesgo de pérdida", "🟢 Se alcanza a consumir",
+         "⚪ Solo lotes en cuarentena"], "🟢 Sin lotes que venzan en el período")
+    return t
+
+
+def render_venc_top(lr, meta_v, prod, clave, que, ref, excl_set=None):
+    excl_set = excl_set or set()
+    st.caption(
+        f"Reporte del {ref:%d/%m/%Y}" + (f" ({meta_v['filtro'].lower()})" if meta_v["filtro"] else "")
+        + ". La demanda es la proyectada. Se supone que cada producto consume primero el lote que vence antes "
+          "y que las bodegas comparten la demanda. Los lotes en cuarentena no se consumen.")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        n = st.slider(f"Cuántos {que} de mayor demanda", 3, 30, 10, key=f"{clave}_vn")
+    with c2:
+        crit = st.radio("Ordenar por", ["Unidades demandadas", "Valor de la demanda ($)"], horizontal=True,
+                        key=f"{clave}_vcrit")
+    p = prod[prod["demanda_h"] > 0].copy()
+    if crit.startswith("Valor"):
+        p = p[~p["codigo"].isin(excl_set)]
+        p["clave_orden"] = p["demanda_h"] * p["precio"]
+    else:
+        p["clave_orden"] = p["demanda_h"]
+    p = p.sort_values("clave_orden", ascending=False).reset_index(drop=True)
+    if p.empty:
+        st.info("No hay productos con demanda proyectada en la vista actual.")
+        return
+    p["puesto"] = np.arange(1, len(p) + 1)
+    t_all = _resumen_lotes(lr, p)
+    t = t_all.head(n)
+    con_venc = t_all[t_all["activos"] > 0]
+
+    n_riesgo = int(((t["vencidos"] > 0) | (t["en_riesgo_activo"] > 0)).sum())
+    n_lotes = int((t["activos"] > 0).sum())
+    if n_riesgo:
+        st.error(f"{n_riesgo} de los {len(t)} {que} de mayor demanda tienen lotes vencidos o que no se alcanzarían "
+                 "a consumir antes de vencer.")
+    elif n_lotes:
+        st.warning(f"{n_lotes} de los {len(t)} {que} de mayor demanda tienen lotes por vencer, pero con la demanda "
+                   "proyectada se alcanzan a consumir.")
+    else:
+        st.success(f"Ninguno de los {len(t)} {que} de mayor demanda tiene lotes por vencer en el período del reporte.")
+        if len(con_venc):
+            f1 = con_venc.iloc[0]
+            st.info(f"El de mayor demanda que sí tiene lotes por vencer es {f1['producto']} (puesto {int(f1['puesto'])}). "
+                    "Abajo está la lista de los que sí tienen vencimientos.")
+    k = st.columns(4)
+    with k[0]:
+        kpi("Con lotes por vencer", n0(n_lotes), f"de los {len(t)} de mayor demanda", "#3B6EA8")
+    with k[1]:
+        kpi("En riesgo de pérdida", n0(int((t["en_riesgo_activo"] > 0).sum())), "No se alcanzan a consumir", "#E8890C")
+    with k[2]:
+        kpi("Vencidos en bodega activa", n0(int((t["vencidos"] > 0).sum())), "Deberían ir a cuarentena", "#B3261E")
+    with k[3]:
+        kpi("Valor en riesgo", clp(t["valor_riesgo"].sum()), "Unidades que no se consumirían", "#B3261E")
+
+    cfg = {
+        "puesto": st.column_config.NumberColumn("N° en demanda", format="%d"), "alerta": "Alerta",
+        "producto": "Producto",
+        "demanda_h": st.column_config.NumberColumn("Demanda proyectada", format="%.0f"),
+        "unidades": st.column_config.NumberColumn("Unidades por vencer", format="%.0f"),
+        "lotes": st.column_config.NumberColumn("Lotes", format="%.0f"),
+        "primer_venc": st.column_config.DateColumn("Primer vencimiento", format="DD/MM/YYYY"),
+        "dias_primero": st.column_config.NumberColumn("Días al primero", format="%.0f"),
+        "en_riesgo": st.column_config.NumberColumn("Unidades en riesgo", format="%.0f"),
+        "valor_riesgo": st.column_config.NumberColumn("Valor en riesgo ($)", format="%.0f")}
+    cols_t = ["puesto", "alerta", "producto", "demanda_h", "unidades", "lotes", "primer_venc", "dias_primero",
+              "en_riesgo", "valor_riesgo"]
+    st.markdown(f"**Los {len(t)} {que} de mayor demanda**")
+    st.dataframe(t[cols_t], hide_index=True, column_config=cfg)
+    st.markdown(f"**Los {que} de mayor demanda que sí tienen lotes por vencer**")
+    st.caption("Ordenados por demanda; el número indica su puesto en el ranking completo.")
+    st.dataframe(con_venc.head(10)[cols_t], hide_index=True, column_config=cfg)
+
+    mostrar = t if n_lotes else con_venc.head(10)
+    lt = lr[lr["codigo"].isin(set(mostrar["codigo"]))].copy()
+    if not lt.empty:
+        orden = [s_[:42] for s_ in mostrar["producto"]]
+        lt = lt.merge(mostrar[["codigo", "producto", "puesto"]].rename(columns={"producto": "prod_top"}),
+                      on="codigo", how="left")
+        lt["prod_corto"] = lt["prod_top"].str[:42]
+        fig = px.scatter(lt, x="vence", y="prod_corto", size="cantidad", color="situacion",
+                         color_discrete_map=SIT_COLOR, category_orders={"prod_corto": orden},
+                         hover_data={"lote": True, "bodega_corta": True, "cantidad": True, "dias": True,
+                                     "prod_corto": False},
+                         labels={"vence": "Fecha de vencimiento", "prod_corto": "", "situacion": "Situación"},
+                         size_max=30, title="Cuándo vence cada lote (el tamaño es la cantidad)")
+        fig.add_shape(type="line", x0=ref.to_pydatetime(), x1=ref.to_pydatetime(), y0=0, y1=1, yref="paper",
+                      line=dict(dash="dash", color="#888"))
+        fig.add_annotation(x=ref.to_pydatetime(), y=1.02, yref="paper", text="Fecha del reporte", showarrow=False)
+        fig.update_layout(height=max(330, 38 * len(orden) + 120), margin=dict(t=60, b=10, l=10, r=10),
+                          yaxis=dict(autorange="reversed"), legend=dict(orientation="h", y=-0.15))
+        st.plotly_chart(fig)
+
+        with st.expander(f"Lotes de los productos del gráfico ({len(lt)})", expanded=False):
+            det = lt.sort_values(["puesto", "vence"])[["puesto", "prod_top", "bodega_corta", "lote", "vence", "dias",
+                                                       "cantidad", "en_riesgo", "valor_riesgo", "situacion"]]
+            st.dataframe(det, hide_index=True,
+                         column_config={
+                             "puesto": st.column_config.NumberColumn("N° en demanda", format="%d"),
+                             "prod_top": "Producto", "bodega_corta": "Bodega", "lote": "Lote",
+                             "vence": st.column_config.DateColumn("Vence", format="DD/MM/YYYY"),
+                             "dias": st.column_config.NumberColumn("Días", format="%.0f"),
+                             "cantidad": st.column_config.NumberColumn("Cantidad", format="%.0f"),
+                             "en_riesgo": st.column_config.NumberColumn("En riesgo", format="%.0f"),
+                             "valor_riesgo": st.column_config.NumberColumn("Valor en riesgo ($)", format="%.0f"),
+                             "situacion": "Situación"})
+            st.download_button("Descargar lotes (CSV)", det.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"vencimientos_{clave}.csv", mime="text/csv", key=f"dl_venc_{clave}")
+
+    with st.expander(f"Todos los lotes de {que} por vencer ({n0(int(lr['codigo'].isin(set(prod['codigo'])).sum()))})",
+                     expanded=False):
+        sit_sel = st.multiselect("Situación", list(SIT_COLOR),
+                                 default=["Vencido en bodega activa", "En riesgo de pérdida"], key=f"{clave}_vsit")
+        nombres = prod.drop_duplicates("codigo").set_index("codigo")["producto"]
+        la = lr[lr["codigo"].isin(set(prod["codigo"])) & lr["situacion"].isin(sit_sel)].copy()
+        la["producto"] = la["codigo"].map(nombres)
+        la = la.sort_values(["dias"])
+        st.dataframe(la[["producto", "bodega_corta", "lote", "vence", "dias", "cantidad", "en_riesgo",
+                         "valor_riesgo", "situacion"]],
+                     hide_index=True,
+                     column_config={
+                         "producto": "Producto", "bodega_corta": "Bodega", "lote": "Lote",
+                         "vence": st.column_config.DateColumn("Vence", format="DD/MM/YYYY"),
+                         "dias": st.column_config.NumberColumn("Días", format="%.0f"),
+                         "cantidad": st.column_config.NumberColumn("Cantidad", format="%.0f"),
+                         "en_riesgo": st.column_config.NumberColumn("En riesgo", format="%.0f"),
+                         "valor_riesgo": st.column_config.NumberColumn("Valor en riesgo ($)", format="%.0f"),
+                         "situacion": "Situación"})
+
+
+def render_insumos(stock_file, salidas_files, licit, u_cr, u_ss, horiz_m, dias_seg, venc_file=None):
+    if stock_file is None or not salidas_files:
+        faltan = []
+        if stock_file is None:
+            faltan.append("el **stock** de la bodega (reporte «Stock en BODEGA…»)")
+        if not salidas_files:
+            faltan.append("las **salidas** de la bodega (reporte «Movimientos en BODEGA…»)")
+        st.info("Para ver esta pestaña falta subir " + " y ".join(faltan)
+                + ". Súbelos en la barra lateral junto con los demás Excel.")
+        return
+    try:
+        stock, meta_s = load_stock_ins(stock_file[1])
+        mov, meta_m = load_salidas(tuple(b for _, b in salidas_files))
+    except Exception as exc:
+        st.error(f"No pude leer los archivos de insumos: {exc}")
+        return
+
+    bl = [b for b in meta_m["bloques"] if b[0] and b[1]]
+    bl_ord = sorted(bl)
+    if any(bl_ord[i][1] >= bl_ord[i + 1][0] for i in range(len(bl_ord) - 1)):
+        st.warning("Los archivos de salidas se superponen en fechas. Si subiste el mismo período dos veces, "
+                   "el consumo se está contando doble.")
+
+    st.caption(
+        f"{meta_s['bodega']}   |   Stock al "
+        f"{meta_s['fecha']:%d/%m/%Y}" if meta_s["fecha"] else f"{meta_s['bodega']}"
+    )
+
+    with st.expander("Qué cuenta como consumo y otros ajustes", expanded=False):
+        tipos_all = sorted(mov["tipo_doc"].unique())
+        defecto = [t for t in tipos_all if t in ("SOLICITUD PRODUCTO", "SOLICITUD EXTRAORDINARIA")] or tipos_all
+        tipos_sel = st.multiselect(
+            "Tipos de salida que cuentan como consumo", tipos_all, default=defecto, key="ins_tipos",
+            help="Las solicitudes a servicios son consumo. Los ajustes de inventario salen y llegan a la misma "
+                 "bodega, y los traspasos van a otros hospitales; por eso quedan fuera por defecto.")
+        dias_per = st.number_input("Días que cubre el archivo de salidas", 1, 1000,
+                                   int(meta_m["dias"]) if meta_m["dias"] > 0 else 30, key="ins_dias")
+        fecha_stock_i = st.date_input("Fecha del stock de insumos", value=meta_s["fecha"] or date.today(),
+                                      key="ins_fecha_stock")
+    if not tipos_sel:
+        st.warning("Elige al menos un tipo de salida para calcular el consumo.")
+        return
+
+    R = calcular_insumos(stock, mov, meta_m, tipos_sel, dias_per, fecha_stock_i, u_cr, u_ss, horiz_m, dias_seg)
+    ins, sal, cons, F, SIG, fcm, C, modo = R["ins"], R["sal"], R["cons"], R["F"], R["SIG"], R["fcm"], R["C"], R["modo"]
+
+    tot_cons = ins["cons_valor"].sum()
+    sosp = ins[ins["precio_sospechoso"]]
+    def_excl = list(sosp[(sosp["cons_valor"] > 0.10 * tot_cons)]["codigo"]) if tot_cons > 0 else []
+    etiqueta = {r.codigo: f"{r.producto}" for r in sosp.itertuples()}
+    with st.expander(f"Productos con precio sospechoso ({len(sosp)})", expanded=bool(def_excl)):
+        st.caption("Un precio muy alto puede inflar todos los montos en pesos. Los productos que elijas aquí "
+                   "se dejan fuera de los montos ($), pero siguen contando en los conteos y estados.")
+        excl_cods = st.multiselect("Dejar fuera de los montos en pesos", list(sosp["codigo"]),
+                                   default=def_excl, format_func=lambda c: etiqueta.get(c, c), key="ins_excl")
+    ins["excl"] = ins["codigo"].isin(excl_cods)
+    excl_set = set(excl_cods)
+
+    f1, f2 = st.columns([2, 1])
+    with f1:
+        buscar = st.text_input("Buscar insumo o código", key="ins_buscar")
+    with f2:
+        reg_opts = ["Regular (6 o más)", "Ocasional (3 a 5)", "Esporádico (1 o 2)", "Sin consumo"]
+        reg_sel = st.multiselect("Regularidad del consumo", reg_opts, default=reg_opts, key="ins_reg",
+                                 help="Los productos con pocas salidas tienen demanda irregular y su estado "
+                                      "puede ser engañoso.")
+    v = ins[ins["regularidad"].isin(reg_sel)]
+    if buscar.strip():
+        t = buscar.strip()
+        v = v[v["producto"].str.contains(t, case=False, na=False, regex=False)
+              | v["codigo"].str.contains(t, case=False, na=False, regex=False)]
+    if v.empty:
+        st.warning("Con estos filtros no queda ningún insumo.")
+        return
+    vm = v[~v["excl"]]
+
+    sub1, sub2, sub3, sub4, sub5, sub6 = st.tabs(
+        ["Estado del stock", "Consumo", "Reposición", "Sin movimiento y licitaciones", "Calidad de datos",
+         "Vencimientos"])
+
+    with sub1:
+        cnt = v["estado"].value_counts().reindex(["QS", "CR", "OK", "SS", "SM", "IN"]).fillna(0).astype(int)
+        total_act = int(cnt[["QS", "CR", "OK", "SS", "SM"]].sum())
+        desc_estado = {"QS": "sin stock y con consumo", "CR": f"menos de {u_cr} days",
+                       "OK": f"{u_cr} a {u_ss - 1} días", "SS": f"{u_ss} días o más"}
+        cols = st.columns(4)
+        for col, e in zip(cols, ["QS", "CR", "OK", "SS"]):
+            with col:
+                kpi(ESTADO_TXT[e], n0(cnt[e]), f"{cnt[e] / max(total_act, 1):.1%}  |  {desc_estado[e]}", ESTADO_COLOR[e])
+        sm = v[v["estado"] == "SM"]
+        cols = st.columns(4)
+        with cols[0]:
+            kpi("SM (con stock y sin salidas)", n0(cnt["SM"]), f"{clp(sm.loc[~sm['excl'], 'valor_stock'].sum())} detenidos",
+                ESTADO_COLOR["SM"])
+        with cols[1]:
+            kpi("Valor del stock", clp(vm["valor_stock"].sum()), "Stock por precio unitario", "#3B6EA8")
+        with cols[2]:
+            kpi("Consumo del período", clp(vm["cons_valor"].sum()), f"En {n0(dias_per)} días", "#2E7D5B")
+        with cols[3]:
+            kpi("IN (sin stock ni salidas)", n0(cnt["IN"]), "Productos sin actividad", ESTADO_COLOR["IN"])
+        st.caption(f"Estado calculado con el stock al {fecha_stock_i:%d/%m/%Y} y el consumo diario promedio "
+                   f"({n0(dias_per)} días). Las reglas de días son las mismas de fármacos.")
+
+        c1, c2 = st.columns([1, 1.4])
+        with c1:
+            orden = ["QS", "CR", "OK", "SS", "SM"]
+            fig = go.Figure(go.Pie(labels=[ESTADO_TXT[e] for e in orden], values=[cnt[e] for e in orden],
+                                   hole=0.55, sort=False, marker=dict(colors=[ESTADO_COLOR[e] for e in orden]),
+                                   textinfo="value+percent"))
+            fig.update_layout(title="Insumos por estado", height=360, margin=dict(t=50, b=10, l=10, r=10),
+                              legend=dict(orientation="h", y=-0.05))
+            st.plotly_chart(fig)
+        with c2:
+            lg = v[v["estado"].isin(["QS", "CR", "OK", "SS", "SM"])].groupby(["regularidad", "estado"]).size().reset_index(name="n")
+            fig = px.bar(lg, x="regularidad", y="n", color="estado", color_discrete_map=ESTADO_COLOR,
+                         category_orders={"regularidad": reg_opts, "estado": orden},
+                         labels={"n": "Insumos", "regularidad": "Regularidad", "estado": "Estado"},
+                         title="Estado según regularidad del consumo")
+            fig.update_layout(height=360, margin=dict(t=50, b=10, l=10, r=10), legend=dict(orientation="h", y=-0.2))
+            st.plotly_chart(fig)
+
+        st.subheader("Los 15 más urgentes")
+        st.caption("Insumos en QS o CR con consumo regular u ocasional, ordenados por consumo valorizado.")
+        urg = v[v["estado"].isin(["QS", "CR"]) & (v["n_mov"] >= 3)].copy()
+        urg["orden_v"] = np.where(urg["excl"], 0, urg["cons_valor"])
+        urg = urg.sort_values("orden_v", ascending=False).head(15)
+        st.dataframe(
+            urg[["estado_icon", "producto", "unidad", "stock", "cons_cant", "n_mov", "tasa_dia", "aut_dias"]],
+            hide_index=True,
+            column_config={
+                "estado_icon": "Estado", "producto": "Insumo", "unidad": "Unidad",
+                "stock": st.column_config.NumberColumn("Stock", format="%.0f"),
+                "cons_cant": st.column_config.NumberColumn("Consumo del período", format="%.0f"),
+                "n_mov": st.column_config.NumberColumn("Salidas", format="%.0f"),
+                "tasa_dia": st.column_config.NumberColumn("Consumo diario", format="%.1f"),
+                "aut_dias": st.column_config.NumberColumn("Autonomía (días)", format="%.1f")})
+
+        st.subheader("Listado completo")
+        est_sel = st.multiselect("Estados a mostrar", ["QS", "CR", "OK", "SS", "SM", "IN"],
+                                 default=["QS", "CR", "OK", "SS", "SM"], key="ins_est_lista")
+        ords = {e: i for i, e in enumerate(["QS", "CR", "OK", "SS", "SM", "IN"])}
+        lst = v[v["estado"].isin(est_sel)].copy()
+        lst["o"] = lst["estado"].map(ords)
+        lst = lst.sort_values(["o", "aut_dias"], na_position="last")
+        vista = lst[["estado_icon", "codigo", "producto", "unidad", "stock", "precio", "valor_stock", "cons_cant",
+                     "n_mov", "regularidad", "tasa_dia", "aut_dias"]]
+        st.dataframe(
+            vista, hide_index=True,
+            column_config={
+                "estado_icon": "Estado", "codigo": "Código", "producto": "Insumo", "unidad": "Unidad",
+                "stock": st.column_config.NumberColumn("Stock", format="%.0f"),
+                "precio": st.column_config.NumberColumn("Precio unitario ($)", format="%.0f"),
+                "valor_stock": st.column_config.NumberColumn("Valor stock ($)", format="%.0f"),
+                "cons_cant": st.column_config.NumberColumn("Consumo del período", format="%.0f"),
+                "n_mov": st.column_config.NumberColumn("Salidas", format="%.0f"),
+                "regularidad": "Regularidad",
+                "tasa_dia": st.column_config.NumberColumn("Consumo diario", format="%.1f"),
+                "aut_dias": st.column_config.NumberColumn("Autonomía (días)", format="%.1f")})
+        st.download_button("Descargar listado de insumos (CSV)", vista.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="estado_insumos.csv", mime="text/csv", key="dl_ins_estado")
+
+    with sub2:
+        cods_v = set(v["codigo"])
+        cons_v = cons[cons["codigo"].isin(cods_v) & ~cons["codigo"].isin(excl_set)].copy()
+        cons_v["servicio"] = cons_v["destino"].map(limpiar_servicio)
+        k = st.columns(3)
+        with k[0]:
+            kpi("Consumo valorizado", clp(cons_v["total"].sum()), f"{n0(cons_v['codigo'].nunique())} productos", "#2E7D5B")
+        otros = sal[sal["codigo"].isin(cods_v) & ~sal["codigo"].isin(excl_set)]
+        aj = otros[otros["tipo_doc"] == "SOLICITUD AJUSTE"]["total"].sum()
+        tr = otros[otros["tipo_doc"] == "TRASPASO"]["total"].sum()
+        with k[1]:
+            kpi("Ajustes de inventario", clp(aj), "Salen y llegan a la misma bodega", "#E8890C")
+        with k[2]:
+            kpi("Traspasos a otros hospitales", clp(tr), "Fuera del consumo por defecto", "#3B6EA8")
+        if excl_set:
+            st.caption(f"Montos sin {len(excl_set)} producto(s) con precio sospechoso (ver el panel de arriba).")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            sv = cons_v.groupby("servicio")["total"].sum().sort_values(ascending=False).head(12).reset_index()
+            fig = px.bar(sv, x="total", y="servicio", orientation="h", color_discrete_sequence=["#2E7D5B"],
+                         labels={"total": "Consumo ($)", "servicio": ""}, title="Consumo valorizado por servicio")
+            fig.update_layout(height=430, margin=dict(t=50, b=10, l=10, r=10), yaxis=dict(autorange="reversed"))
+            st.plotly_chart(fig)
+        with c2:
+            td = otros.groupby("tipo_doc")["total"].sum().sort_values(ascending=False).reset_index()
+            fig = px.bar(td, x="total", y="tipo_doc", orientation="h", color_discrete_sequence=["#3B6EA8"],
+                         labels={"total": "Valor de las salidas ($)", "tipo_doc": ""}, title="Salidas por tipo de documento")
+            fig.update_layout(height=430, margin=dict(t=50, b=10, l=10, r=10), yaxis=dict(autorange="reversed"))
+            st.plotly_chart(fig)
+
+        top = vm.sort_values("cons_valor", ascending=False).head(15)
+        fig = px.bar(top, x="cons_valor", y="producto", orientation="h", color="estado",
+                     color_discrete_map=ESTADO_COLOR, category_orders={"estado": ["QS", "CR", "OK", "SS", "SM"]},
+                     labels={"cons_valor": "Consumo del período ($)", "producto": "", "estado": "Estado"},
+                     title="Los 15 insumos con mayor consumo valorizado")
+        fig.update_layout(height=480, margin=dict(t=50, b=10, l=10, r=10), yaxis=dict(autorange="reversed"),
+                          legend=dict(orientation="h", y=-0.12))
+        st.plotly_chart(fig)
+
+        st.subheader("Qué consume cada servicio")
+        servs = sorted(cons_v["servicio"].unique())
+        if servs:
+            sv_sel = st.selectbox("Servicio", servs, key="ins_serv")
+            ps = cons_v[cons_v["servicio"] == sv_sel].groupby(["codigo", "producto"]).agg(
+                cantidad=("cantidad", "sum"), valor=("total", "sum"), salidas=("cantidad", "size")).reset_index()
+            ps = ps.sort_values("valor", ascending=False).head(20)
+            st.dataframe(ps[["producto", "cantidad", "valor", "salidas"]], hide_index=True,
+                         column_config={"producto": "Insumo",
+                                        "cantidad": st.column_config.NumberColumn("Cantidad", format="%.0f"),
+                                        "valor": st.column_config.NumberColumn("Valor ($)", format="%.0f"),
+                                        "salidas": st.column_config.NumberColumn("Salidas", format="%.0f")})
+
+        st.subheader("Análisis ABC (dónde está el dinero)")
+        base_abc = st.radio("Clasificar según", ["Valor del stock", "Consumo valorizado"], horizontal=True,
+                            key="ins_abc")
+        colv = "valor_stock" if base_abc == "Valor del stock" else "cons_valor"
+        ab = vm[vm[colv] > 0].sort_values(colv, ascending=False).reset_index(drop=True)
+        if len(ab) >= 3:
+            tot = ab[colv].sum()
+            share = ab[colv] / tot
+            cum = share.cumsum()
+            ab["clase"] = np.where(cum - share < 0.80, "A", np.where(cum - share < 0.95, "B", "C"))
+            a_, b_, c_ = (ab["clase"] == "A").sum(), (ab["clase"] == "B").sum(), (ab["clase"] == "C").sum()
+            k = st.columns(3)
+            with k[0]:
+                kpi("Clase A", n0(a_), f"Productos que suman el 80% del valor ({a_ / len(ab):.0%} de los productos)", "#B3261E")
+            with k[1]:
+                kpi("Clase B", n0(b_), "Siguiente 15% del valor", "#E8890C")
+            with k[2]:
+                kpi("Clase C", n0(c_), "Último 5% del valor", "#8A8A8A")
+            fig = go.Figure(go.Scatter(x=(np.arange(len(ab)) + 1) / len(ab) * 100, y=cum * 100, mode="lines",
+                                       line=dict(color="#3B6EA8", width=3)))
+            fig.add_hline(y=80, line_dash="dash", line_color="#888")
+            fig.add_hline(y=95, line_dash="dash", line_color="#888")
+            fig.update_layout(height=340, margin=dict(t=20, b=10, l=10, r=10),
+                              xaxis_title="% de los productos (de mayor a menor valor)",
+                              yaxis_title="% acumulado del valor")
+            st.plotly_chart(fig)
+            st.dataframe(ab[["clase", "producto", "stock", colv]].head(40), hide_index=True,
+                         column_config={"clase": "Clase", "producto": "Insumo",
+                                        "stock": st.column_config.NumberColumn("Stock", format="%.0f"),
+                                        colv: st.column_config.NumberColumn(base_abc + " ($)", format="%.0f")})
+        else:
+            st.info("No hay suficientes productos con valor para el análisis ABC.")
+
+    with sub3:
+        if modo == "mensual":
+            st.caption(f"Proyección con modelos mensuales ({len(R['months'])} meses de historia: "
+                       f"{mes_label(R['months'][0])} a {mes_label(R['months'][-1])}).")
+        else:
+            st.caption("Proyección con el **consumo diario promedio** del período: los movimientos no traen fecha, "
+                       "así que no hay tendencia ni rango probable. Con archivos de salidas mes a mes "
+                       "(o con una columna de fecha) la pestaña usa los mismos modelos que fármacos.")
+        st.caption(f"Compra sugerida = demanda de {horiz_m} meses + {dias_seg} días de seguridad - stock. "
+                   "Los meses y días se cambian en la barra lateral (Parámetros de proyección).")
+        umb = st.slider("Alertar quiebres dentro de (días)", 7, 180, 30, key="ins_umb")
+        solo = st.checkbox("Mostrar solo insumos con compra sugerida", value=True, key="ins_solo")
+        solo_reg = st.checkbox("Considerar solo consumo regular y ocasional (3 o más salidas)", value=True, key="ins_solo_reg",
+                               help="Los productos con 1 o 2 salidas en el período se piden de vez en cuando; "
+                                    "proyectar una compra para ellos suele sobreestimar.")
+        vr = v[v["n_mov"] >= 3] if solo_reg else v
+        vrm = vr[~vr["excl"]]
+        conc = vrm[vrm["compra"] > 0]
+        pq = vr[(vr["quiebre_dias"] <= umb) & (vr["estado"].isin(["CR", "OK", "SS"]))]
+        k = st.columns(3)
+        with k[0]:
+            kpi("Insumos con compra sugerida", n0((vr["compra"] > 0).sum()), f"de {n0(len(vr))}", "#3B6EA8")
+        with k[1]:
+            kpi("Valor estimado de la compra", clp(conc["compra_valor"].sum()), "Solo productos con precio", "#3B6EA8")
+        with k[2]:
+            kpi(f"Se quedan sin stock en {umb} días", n0(len(pq)), "Sin contar los que ya están en QS", "#E8890C")
+
+        tb = vr.copy()
+        if solo:
+            tb = tb[tb["compra"] > 0]
+        tb["ov"] = np.where(tb["excl"], 0, tb["compra_valor"].fillna(0))
+        tb = tb.sort_values("ov", ascending=False)
+        vista3 = tb[["estado_icon", "producto", "unidad", "stock", "demanda_h", "compra", "compra_valor",
+                     "quiebre_dias", "n_mov", "modelo", "confianza"]]
+        st.dataframe(
+            vista3, hide_index=True,
+            column_config={
+                "estado_icon": "Estado", "producto": "Insumo", "unidad": "Unidad",
+                "stock": st.column_config.NumberColumn("Stock", format="%.0f"),
+                "demanda_h": st.column_config.NumberColumn(f"Demanda {horiz_m} meses", format="%.0f"),
+                "compra": st.column_config.NumberColumn("Compra sugerida", format="%.0f"),
+                "compra_valor": st.column_config.NumberColumn("Valor compra ($)", format="%.0f"),
+                "quiebre_dias": st.column_config.NumberColumn("Días a quiebre", format="%.0f"),
+                "n_mov": st.column_config.NumberColumn("Salidas", format="%.0f"),
+                "modelo": "Modelo", "confianza": "Confianza"})
+        st.download_button("Descargar compras sugeridas de insumos (CSV)",
+                           vista3.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="compras_insumos.csv", mime="text/csv", key="dl_ins_compra")
+
+        st.subheader("Ficha de un insumo")
+        fo = v.assign(o=v["estado"].map(ords)).sort_values(["o", "cons_valor"], ascending=[True, False])
+        pos_by_cod = {c: i for i, c in enumerate(ins["codigo"])}
+        opciones = list(fo["codigo"])
+        cod = st.selectbox("Insumo", opciones, key="ins_ficha",
+                           format_func=lambda c: f"{ESTADO_ICON[ins.at[pos_by_cod[c], 'estado']]}  "
+                                                 f"{ins.at[pos_by_cod[c], 'producto']}")
+        i = pos_by_cod[cod]
+        r = ins.loc[i]
+        k = st.columns(4)
+        with k[0]:
+            kpi("Estado", ESTADO_TXT[r["estado"]], f"{n0(r['n_mov'])} salidas en el período", ESTADO_COLOR[r["estado"]])
+        with k[1]:
+            kpi("Stock", n0(r["stock"]), f"Consumo diario: {r['tasa_dia']:.1f}")
+        with k[2]:
+            if not np.isfinite(r["quiebre_dias"]):
+                kpi("Quiebre proyectado", "Sin quiebre", "Sin consumo proyectado")
+            else:
+                kpi("Quiebre proyectado", f"{r['quiebre_fecha']:%d/%m/%Y}", f"En {r['quiebre_dias']:.0f} días desde el stock")
+        with k[3]:
+            kpi("Compra sugerida", n0(r["compra"]), f"Para {horiz_m} meses | {clp(r['compra_valor'])}")
+
+        n_show = int(min(N_DIAS_PROY, max(R["hd"] * 2, 120)))
+        fechas = [pd.Timestamp(fecha_stock_i) + pd.Timedelta(days=d) for d in range(n_show + 1)]
+        nivel = np.concatenate([[r["stock"]], np.clip(r["stock"] - C[i, :n_show], 0, None)])
+        fig = go.Figure(go.Scatter(x=fechas, y=nivel, mode="lines", fill="tozeroy", name="Stock proyectado",
+                                   line=dict(color="#3B6EA8", width=3)))
+        seg_u = R["C"][i, R["hd"] - 1] / R["hd"] * dias_seg
+        fig.add_hline(y=seg_u, line_dash="dash", line_color="#E8890C", annotation_text="Stock de seguridad")
+        fig.update_layout(height=340, margin=dict(t=20, b=10, l=10, r=10), yaxis_title="Unidades",
+                          title="Stock proyectado (sin ingresos)")
+        st.plotly_chart(fig)
+        if modo == "mensual":
+            hx = [mes_ts(m) for m in R["months"]]
+            fx = [mes_ts(m) for m in fcm[:6]]
+            dfc = np.array([calendar.monthrange(y, m)[1] for y, m in fcm[:6]], float)
+            fy = F[i, :6] * dfc
+            flo = np.clip(F[i, :6] - Z80 * SIG[i, :6], 0, None) * dfc
+            fhi = (F[i, :6] + Z80 * SIG[i, :6]) * dfc
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=fx + fx[::-1], y=list(fhi) + list(flo[::-1]), fill="toself",
+                                     fillcolor="rgba(59,110,168,0.18)", line=dict(width=0),
+                                     name="Rango probable (80 %)", hoverinfo="skip"))
+            fig.add_trace(go.Scatter(x=hx, y=R["Y"][i], mode="lines+markers", name="Consumo real",
+                                     line=dict(color="#2E7D5B", width=3)))
+            fig.add_trace(go.Scatter(x=[hx[-1]] + fx, y=[Y[i][-1]] + list(fy), mode="lines+markers",
+                                     name="Proyección", line=dict(color="#3B6EA8", width=3, dash="dash")))
+            fig.update_layout(height=340, margin=dict(t=20, b=10, l=10, r=10), yaxis_title="Unidades por mes",
+                              legend=dict(orientation="h", y=-0.2), hovermode="x unified")
+            st.plotly_chart(fig)
+        mv = sal[sal["codigo"] == cod].copy()
+        mv["destino"] = mv["destino"].map(limpiar_servicio)
+        st.markdown("**Salidas de este insumo**")
+        st.dataframe(mv[["tipo_doc", "destino", "cantidad", "total"]], hide_index=True,
+                     column_config={"tipo_doc": "Tipo de documento", "destino": "Destino",
+                                    "cantidad": st.column_config.NumberColumn("Cantidad", format="%.0f"),
+                                    "total": st.column_config.NumberColumn("Valor ($)", format="%.0f")})
+
+    with sub4:
+        st.subheader("Stock sin movimiento")
+        sm_df = v[v["estado"] == "SM"].sort_values("valor_stock", ascending=False)
+        kpi("Stock detenido", clp(sm_df.loc[~sm_df["excl"], "valor_stock"].sum()),
+            f"{n0(len(sm_df))} productos con stock y sin salidas en el período", ESTADO_COLOR["SM"])
+        st.dataframe(sm_df[["producto", "unidad", "stock", "precio", "valor_stock"]], hide_index=True,
+                     column_config={"producto": "Insumo", "unidad": "Unidad",
+                                    "stock": st.column_config.NumberColumn("Stock", format="%.0f"),
+                                    "precio": st.column_config.NumberColumn("Precio unitario ($)", format="%.0f"),
+                                    "valor_stock": st.column_config.NumberColumn("Valor ($)", format="%.0f")})
+
+        st.subheader("Licitaciones")
+        if licit is None or licit.empty:
+            st.info("Para cruzar con licitaciones, sube también `reportes.zip` o el reporte de licitaciones.")
+        else:
+            lg_ = licit.groupby("Código").agg(
+                licitacion=("Licitación", "first"), saldo=("Saldo", "sum"), vcto=("Vencimiento", "min"),
+                proveedor=("Proveedor", "first")).reset_index().rename(columns={"Código": "codigo"})
+            cz = v.merge(lg_, on="codigo", how="left")
+            ref = pd.Timestamp(R["corte"])
+            cz["vcto_dias"] = (cz["vcto"] - ref).dt.days
+            cz["cob_meses"] = np.where(cz["tasa_dia"] > 0, cz["saldo"] / (cz["tasa_dia"] * 30.4375), np.inf)
+            con = cz[cz["licitacion"].notna()]
+            urg_ = cz[cz["estado"].isin(["QS", "CR"]) & (cz["n_mov"] >= 3)]
+            k = st.columns(3)
+            with k[0]:
+                kpi("Insumos con licitación", n0(len(con)), f"de {n0(len(cz))} en la vista", "#3B6EA8")
+            with k[1]:
+                kpi("QS o CR con licitación y saldo", n0((urg_["saldo"] > 0).sum()), "Se pueden reponer con el contrato", "#2E7D5B")
+            with k[2]:
+                kpi("QS o CR sin licitación o sin saldo", n0(((urg_["saldo"].fillna(0)) <= 0).sum()),
+                    "Requieren otra vía de compra", "#B3261E")
+            u_v = st.slider("Alertar licitaciones que vencen en menos de (días)", 30, 365, 180, key="ins_u_lic")
+            u_c = st.slider("Alertar saldo que cubre menos de (meses)", 1, 12, 3, key="ins_u_cob")
+            al = con[(con["vcto_dias"] < u_v) | (con["cob_meses"] < u_c)].sort_values("vcto_dias")
+            st.markdown(f"**Licitaciones en alerta: {n0(len(al))}**")
+            st.dataframe(al[["estado_icon", "producto", "licitacion", "proveedor", "saldo", "cob_meses", "vcto", "vcto_dias"]],
+                         hide_index=True,
+                         column_config={
+                             "estado_icon": "Estado", "producto": "Insumo", "licitacion": "Licitación",
+                             "proveedor": "Proveedor",
+                             "saldo": st.column_config.NumberColumn("Saldo", format="%.0f"),
+                             "cob_meses": st.column_config.NumberColumn("Cobertura del saldo (meses)", format="%.1f"),
+                             "vcto": st.column_config.DateColumn("Vence", format="DD/MM/YYYY"),
+                             "vcto_dias": st.column_config.NumberColumn("Días al vencimiento", format="%.0f")})
+            st.markdown("**QS o CR sin licitación o sin saldo**")
+            sl = urg_[urg_["saldo"].fillna(0) <= 0].sort_values("cons_valor", ascending=False)
+            st.dataframe(sl[["estado_icon", "producto", "stock", "cons_cant", "n_mov", "licitacion"]], hide_index=True,
+                         column_config={"estado_icon": "Estado", "producto": "Insumo",
+                                        "stock": st.column_config.NumberColumn("Stock", format="%.0f"),
+                                        "cons_cant": st.column_config.NumberColumn("Consumo del período", format="%.0f"),
+                                        "n_mov": st.column_config.NumberColumn("Salidas", format="%.0f"),
+                                        "licitacion": "Licitación"})
+
+    with sub5:
+        st.caption("Cosas de los archivos que conviene revisar antes de usar los números.")
+        sin_stock = sal[~sal["codigo"].isin(set(stock["codigo"]))]["codigo"].nunique()
+        k = st.columns(4)
+        with k[0]:
+            kpi("Precio en cero o negativo", n0(ins["precio_cero"].sum()), "En el archivo de stock", "#E8890C")
+        with k[1]:
+            kpi("Precio distinto entre archivos", n0(ins["precio_difiere"].sum()), "Salidas vs stock (3 veces o más)", "#E8890C")
+        with k[2]:
+            kpi("Precio atípico", n0(ins["precio_atipico"].sum()), "Muy sobre productos parecidos", "#B3261E")
+        with k[3]:
+            kpi("Con salidas pero sin stock registrado", n0(sin_stock), "No están en el archivo de stock", "#3B6EA8")
+        rev = ins[ins["precio_sospechoso"]].copy()
+        rev["motivo"] = np.select([rev["precio_atipico"], rev["precio_cero"], rev["precio_difiere"]],
+                                  ["Precio muy sobre productos parecidos", "Precio en cero o negativo",
+                                   "Precio distinto entre stock y salidas"], "")
+        rev = rev.sort_values("cons_valor", ascending=False)
+        st.dataframe(rev[["producto", "motivo", "precio_arch", "pu_mov", "stock", "cons_valor"]], hide_index=True,
+                     column_config={"producto": "Insumo", "motivo": "Motivo",
+                                    "precio_arch": st.column_config.NumberColumn("Precio en stock ($)", format="%.0f"),
+                                    "pu_mov": st.column_config.NumberColumn("Precio en salidas ($)", format="%.0f"),
+                                    "stock": st.column_config.NumberColumn("Stock", format="%.0f"),
+                                    "cons_valor": st.column_config.NumberColumn("Consumo ($)", format="%.0f")})
+        st.markdown(
+            f"- El archivo de salidas cubre **{n0(meta_m['dias'])} días**"
+            + (f" ({min(b[0] for b in bl):%d/%m/%Y} a {max(b[1] for b in bl):%d/%m/%Y})." if bl else ".")
+            + "\n- El stock está fechado al "
+            + (f"**{meta_s['fecha']:%d/%m/%Y}**" if meta_s["fecha"] else "(fecha no informada)")
+            + " y no hay ingresos en los archivos, así que no se puede reconstruir el stock de hoy.\n"
+            + ("- Los movimientos no traen fecha: la proyección usa el consumo diario promedio."
+               if modo == "constante" else "- Hay fechas en los movimientos: la proyección usa modelos mensuales."))
+
+    with sub6:
+        if venc_file is None:
+            st.info("Sube el reporte de stock por lote («Reporte de Stock… productos que vencen en los próximos N días») "
+                    "para ver qué insumos de mayor demanda están por vencer.")
+        else:
+            try:
+                vl, meta_v = load_vencimientos(venc_file[1])
+            except Exception as exc:
+                st.error(f"No pude leer el reporte de vencimientos: {exc}")
+            else:
+                ref_v = pd.Timestamp(meta_v["fecha"] or date.today())
+                lots_i = riesgo_fefo(vl[vl["codigo"].isin(set(ins["codigo"]))],
+                                     ins.set_index("codigo")["tasa_fc_dia"], ref_v)
+                render_venc_top(lots_i, meta_v, v, "ins", "insumos", ref_v, excl_set)
+
+
+with st.sidebar:
+    st.header("Datos")
+    ups = st.file_uploader(
+        "Archivos (.zip, .xlsx, .csv)", type=["zip", "xlsx", "csv"], accept_multiple_files=True,
+        help="Sube directamente 'reportes.zip' (o los archivos sueltos), junto con el stock y las salidas de IM2.")
+
+archivos = reunir_archivos(ups)
+tiene_crudos = hay_archivos_crudos_farmacos(archivos)
+
+with st.sidebar:
+    st.caption("Archivos detectados")
+    if archivos["farmacos"]:
+        st.caption("Fármacos: " + archivos["farmacos"][0] + (" + cruce crudos" if tiene_crudos else ""))
+    elif tiene_crudos:
+        st.caption("Fármacos: generado automáticamente desde reportes.zip / crudos")
+    else:
+        st.caption("Fármacos: falta (sube reportes.zip o Reporte_Farmacos)")
+    st.caption("Stock de insumos (IM2): " + (archivos["stock_insumos"][0] if archivos["stock_insumos"] else "falta"))
+    st.caption("Salidas de insumos (IM2): " + (", ".join(n for n, _ in archivos["salidas_insumos"])
+                                               if archivos["salidas_insumos"] else "falta"))
+    st.caption("Vencimientos: " + (archivos["vencimientos"][0] if archivos["vencimientos"] else "falta (opcional)"))
+
+if archivos["farmacos"] is None and not tiene_crudos:
+    st.title("Fármacos e insumos: estado de stock y demanda")
+    st.info("Sube **`reportes.zip`** (o los reportes crudos de fármacos) en la barra lateral para armar y cruzar automáticamente la base de fármacos.")
+    st.header("Insumos")
+    render_insumos(archivos["stock_insumos"], archivos["salidas_insumos"], None, 30, 360, 3, 20,
+                   archivos["vencimientos"])
+    st.stop()
+
+if archivos["farmacos"] is not None:
+    origen, file_bytes = archivos["farmacos"]
+    data_base = load_data(file_bytes)
+else:
+    origen = "Cruce automático (reportes.zip)"
+    data_base = cargar_base_semilla()
+
+data = cruzar_datos_crudos(data_base, archivos)
+ars, conv, venc, precios = data["ars"], data["conv"], data["venc"], data["precios"]
+
+if data.get("log_cruces"):
+    with st.sidebar:
+        st.success("✅ Cruce automático realizado:\n- " + "\n- ".join(data["log_cruces"]))
+        st.download_button(
+            "📥 Descargar Reporte_Farmacos(NUEVA).xlsx",
+            data=exportar_excel_cruzado(data),
+            file_name="Reporte Farmacos (NUEVA).xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+cons_cols = sorted(
+    [c for c in ars.columns if re.match(r"^[A-Z]{3}-\d{2} CONS$", c) and parse_mes(c)],
+    key=lambda c: parse_mes(c),
+)
+if len(cons_cols) < MIN_TRAIN + 1:
+    st.error("No encontré al menos 4 columnas de consumo mensual (formato 'ENE-26 CONS').")
+    st.stop()
+months = tuple(parse_mes(c) for c in cons_cols)
+fc_months = []
+ym = months[-1]
+for _ in range(HORIZONTE_FC):
+    ym = next_month(ym)
+    fc_months.append(ym)
+
+try:
+    if data["fecha_txt"]:
+        dd, mm = data["fecha_txt"]
+        y0 = months[-1][0] + (1 if mm < months[-1][1] else 0)
+        fecha_def = date(y0, mm, dd)
+    else:
+        fecha_def = date.today()
+except ValueError:
+    fecha_def = date.today()
+
+with st.sidebar:
+    st.header("Filtros de fármacos")
+    excluir_sr = st.toggle(
+        "Excluir fármacos sin rotación (SR)",
+        value=False,
+        help="Activado: misma vista que la tabla dinámica de la hoja REPORTE. "
+             "Desactivado: todos los fármacos del arsenal.",
+    )
+    rot_opts = [r for r in ROT_ORDEN if r in set(ars["ROTACION"].dropna().astype(str))]
+    rot_sel = st.multiselect("Rotación", rot_opts, default=rot_opts)
+    cen_opts = sorted(set(ars["ESTADO CENABAST"].fillna("Sin Cenabast").astype(str)))
+    cen_sel = st.multiselect("Estado Cenabast", cen_opts, default=cen_opts)
+    texto = st.text_input("Buscar fármaco o código")
+
+    with st.expander("Parámetros de proyección y compra", expanded=False):
+        fecha_stock = st.date_input("Fecha del stock", value=fecha_def,
+                                    help="Día al que corresponde el stock del Excel.")
+        base_stock = st.radio("Stock a considerar",
+                              ["Sin stocklight (como el REPORTE)", "Stock total"], index=0)
+        desc_cen = st.checkbox("Sumar entregas Cenabast por llegar", value=True,
+                               help="Usa 'CANT ENTREGA CENABAST' como stock que aún no ingresa.")
+        horiz_m = st.slider("Meses a cubrir con la compra", 1, 12, 3)
+        dias_seg = st.slider("Días de stock de seguridad", 0, 60, 20)
+
+    with st.expander("Reglas de estado (avanzado)", expanded=False):
+        u_cr = st.number_input("Crítico si autonomía menor a (días)", 1, 365, 30)
+        u_ss = st.number_input("Sobre stock si autonomía desde (días)", 60, 3650, 360)
+        rot_recalc = st.checkbox(
+            "Recalcular rotación con el mayor consumo de los últimos 3 meses",
+            value=False,
+            help="En el Excel, MAYOR CONSUMO = MAX(JUN, AGO) y no considera JUL. "
+                 "Marca esto para usar los tres meses.",
+        )
+
+
+def num(name, default=0.0):
+    if name in ars.columns:
+        return pd.to_numeric(ars[name], errors="coerce").fillna(default)
+    return pd.Series(default, index=ars.index, dtype=float)
+
+
+Y = ars[cons_cols].apply(pd.to_numeric, errors="coerce").fillna(0).to_numpy(float)
+
+b = pd.DataFrame({
+    "codigo": ars["dato"],
+    "descripcion": ars["DESCRIPCION"].astype(str),
+    "stock_total": num("STOCK TOTAL"),
+    "stock_sin": num("STOCK SIN STOCKLIGHT"),
+    "stock_ideal": num("STOCK IDEAL"),
+    "consumo_prom": num("CONSUMO PROMEDIO"),
+    "consumo_dia": num("CONSUMO DIARIO"),
+    "cen_prog": num("CANT PROGRAMADA CENABAST"),
+    "cen_falt": num("CANT FALTANTE CENABAST"),
+    "cen_ent": num("CANT ENTREGA CENABAST"),
+    "estado_cenabast": ars["ESTADO CENABAST"].fillna("Sin Cenabast").astype(str)
+    if "ESTADO CENABAST" in ars.columns else "Sin Cenabast",
+    "seguimiento": ars["SEGUIMIENTO"] if "SEGUIMIENTO" in ars.columns else "",
+})
+
+if "AUTONOMIA DIAS (HOSP - STOCKLIGHT)" in ars.columns:
+    b["aut_dias"] = num("AUTONOMIA DIAS (HOSP - STOCKLIGHT)")
+else:
+    b["aut_dias"] = np.where(b["consumo_dia"] > 0, b["stock_sin"] / b["consumo_dia"].replace(0, np.nan), 0)
+b["aut_dias"] = pd.Series(b["aut_dias"]).fillna(0)
+
+b["estado"] = np.select([b["aut_dias"] <= 0, b["aut_dias"] < u_cr, b["aut_dias"] < u_ss],
+                        ["QS", "CR", "OK"], "SS")
+
+if rot_recalc or "ROTACION" not in ars.columns:
+    b["rotacion"] = rot_from_consumo(Y[:, -3:].max(axis=1))
+else:
+    b["rotacion"] = ars["ROTACION"].astype(str).values
+
+b["precio"] = b["codigo"].map(precios)
+
+cv = conv.set_index("dato")
+b["convenio"] = b["codigo"].map(cv["ID LICITACION"]) if len(cv) else np.nan
+b["conv_saldo"] = b["codigo"].map(cv["SALDO"]) if len(cv) else np.nan
+b["conv_vcto"] = pd.to_datetime(b["codigo"].map(cv["VCTO"])) if len(cv) else pd.NaT
+fecha_stock_ts = pd.Timestamp(fecha_stock)
+b["conv_vcto_dias"] = (b["conv_vcto"] - fecha_stock_ts).dt.days
+
+fc = run_forecast(Y, months, HORIZONTE_FC)
+F, SIG = fc["F"], fc["SIG"]
+days_fc = np.array([calendar.monthrange(y, m)[1] for y, m in fc_months], dtype=float)
+b["modelo"] = fc["best"]
+b["wape"] = fc["wape"]
+b["confianza"] = np.select(
+    [b["modelo"] == "Sin consumo", b["wape"].isna(), b["wape"] < 0.15, b["wape"] < 0.35],
+    ["Sin consumo", "s/d", "Alta", "Media"], "Baja")
+
+stock_vec = (b["stock_sin"] if base_stock.startswith("Sin") else b["stock_total"]).to_numpy(float)
+inc_vec = b["cen_ent"].to_numpy(float) if desc_cen else np.zeros(len(b))
+avail = stock_vec + inc_vec
+N_DIAS = 730
+D = demanda_diaria(F, fc_months, fecha_stock, N_DIAS)
+C = np.cumsum(D, axis=1)
+hd = int(round(horiz_m * 30.4375))
+dem_h = C[:, hd - 1]
+seg = dem_h / hd * dias_seg
+b["stock_base"] = stock_vec
+b["cen_por_llegar"] = inc_vec
+b["demanda_h"] = dem_h
+b["compra"] = np.ceil(np.clip(dem_h + seg - avail, 0, None))
+b["compra_valor"] = b["compra"] * b["precio"]
+q = dias_hasta_quiebre(C, D, avail)
+b["quiebre_dias"] = q
+b["quiebre_fecha"] = pd.NaT
+fin = np.isfinite(q)
+b.loc[fin, "quiebre_fecha"] = fecha_stock_ts + pd.to_timedelta(q[fin], unit="D")
+b["tasa_fc_dia"] = F[:, :3].mean(axis=1)
+
+m1 = fc_months[0]
+b["proy_mes1"] = F[:, 0] * days_fc[0]
+prog_col = f"PROG {mes_label(m1)}"
+b["prog_mes1"] = num(prog_col, np.nan) if prog_col in ars.columns else np.nan
+
+
+def senal_prog(p, q_):
+    if np.isnan(p):
+        return "Sin dato"
+    if q_ <= 0 and p <= 0:
+        return "Sin demanda"
+    if p <= 0:
+        return "Sin programación"
+    if q_ <= 0:
+        return "Sobreprogramado"
+    r = p / q_
+    return "Subprogramado" if r < 0.85 else ("Sobreprogramado" if r > 1.3 else "Alineado")
+
+
+b["senal_prog"] = [senal_prog(p, q_) for p, q_ in zip(b["prog_mes1"], b["proy_mes1"])]
+
+mask = pd.Series(True, index=b.index)
+if excluir_sr:
+    mask &= b["rotacion"] != "SR"
+if rot_sel:
+    mask &= b["rotacion"].isin(rot_sel)
+if cen_sel:
+    mask &= b["estado_cenabast"].isin(cen_sel)
+if texto.strip():
+    t = texto.strip()
+    mask &= (b["descripcion"].str.contains(t, case=False, na=False, regex=False)
+             | b["codigo"].str.contains(t, case=False, na=False, regex=False))
+df = b[mask].copy()
+df["estado_icon"] = df["estado"].map(ESTADO_ICON)
+
+st.title("Fármacos e insumos: estado de stock y demanda")
+st.caption(
+    f"Origen: {origen}   |   Stock al {fecha_stock:%d/%m/%Y}   |   "
+    f"Consumo real {mes_label(months[0])} a {mes_label(months[-1])}   |   "
+    f"Mostrando {n0(len(df))} de {n0(len(b))} fármacos"
+    + ("   |   sin rotación (SR) excluidos" if excluir_sr else "")
+)
+
+NOMBRES_TABS = ["Estado actual", "Ficha por fármaco", "Proyección y compras", "Alertas", "Insumos"]
+if df.empty:
+    tabs_v = st.tabs(NOMBRES_TABS)
+    with tabs_v[0]:
+        st.warning("Con los filtros actuales no queda ningún fármaco. Ajusta los filtros de la izquierda.")
+    with tabs_v[4]:
+        render_insumos(archivos["stock_insumos"], archivos["salidas_insumos"], data["licit"],
+                       u_cr, u_ss, horiz_m, dias_seg, archivos["vencimientos"])
+    st.stop()
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(NOMBRES_TABS)
+
+with tab1:
+    cnt = df["estado"].value_counts().reindex(ESTADOS).fillna(0).astype(int)
+    total = int(cnt.sum())
+    cols = st.columns(4)
+    desc_estado = {
+        "QS": "sin autonomía",
+        "CR": f"menos de {u_cr} días",
+        "OK": f"{u_cr} a {u_ss - 1} días",
+        "SS": f"{u_ss} días o más",
+    }
+    for col, e in zip(cols, ESTADOS):
+        with col:
+            kpi(ESTADO_TXT[e], n0(cnt[e]), f"{cnt[e] / total:.1%} del total  |  {desc_estado[e]}", ESTADO_COLOR[e])
+
+    c1, c2 = st.columns([1, 1.4])
+    with c1:
+        fig = go.Figure(go.Pie(
+            labels=[ESTADO_TXT[e] for e in ESTADOS], values=[cnt[e] for e in ESTADOS],
+            hole=0.55, sort=False, marker=dict(colors=[ESTADO_COLOR[e] for e in ESTADOS]),
+            textinfo="value+percent"))
+        fig.update_layout(title="Fármacos por estado", height=360, margin=dict(t=50, b=10, l=10, r=10),
+                          legend=dict(orientation="h", y=-0.05))
+        st.plotly_chart(fig)
+    with c2:
+        ct = pd.crosstab(df["estado"], df["rotacion"]).reindex(ESTADOS).fillna(0).astype(int)
+        ct = ct[[r for r in ROT_ORDEN if r in ct.columns]]
+        long = ct.reset_index().melt(id_vars="estado", var_name="rotacion", value_name="n")
+        fig = px.bar(long, x="rotacion", y="n", color="estado", color_discrete_map=ESTADO_COLOR,
+                     category_orders={"estado": ESTADOS, "rotacion": list(ct.columns)},
+                     labels={"n": "Fármacos", "rotacion": "Rotación", "estado": "Estado"},
+                     title="Estado según rotación")
+        fig.update_layout(height=360, margin=dict(t=50, b=10, l=10, r=10), legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig)
+
+    with st.expander("Tabla estado por rotación (igual a la tabla dinámica del REPORTE)", expanded=False):
+        ct_t = ct.copy()
+        ct_t["Total"] = ct_t.sum(axis=1)
+        ct_t.loc["Total"] = ct_t.sum()
+        st.dataframe(ct_t)
+
+    c3, c4 = st.columns(2)
+    with c3:
+        h = df[df["estado"] != "QS"].copy()
+        h["aut_cap"] = np.minimum(h["aut_dias"], 720)
+        fig = px.histogram(h, x="aut_cap", color="estado", nbins=48, color_discrete_map=ESTADO_COLOR,
+                           category_orders={"estado": ESTADOS},
+                           labels={"aut_cap": "Autonomía (días)", "estado": "Estado"},
+                           title="Distribución de la autonomía (sin QS)")
+        fig.add_vline(x=u_cr, line_dash="dash", line_color="#888")
+        fig.add_vline(x=u_ss, line_dash="dash", line_color="#888")
+        fig.update_layout(height=340, margin=dict(t=50, b=10, l=10, r=10), legend=dict(orientation="h", y=-0.25),
+                          yaxis_title="Fármacos")
+        st.plotly_chart(fig)
+        st.caption("Los valores sobre 720 días se agrupan en el último tramo.")
+    with c4:
+        fig = px.bar(df.groupby(["estado_cenabast", "estado"]).size().reset_index(name="n"),
+                     x="estado_cenabast", y="n", color="estado", color_discrete_map=ESTADO_COLOR,
+                     category_orders={"estado": ESTADOS},
+                     labels={"n": "Fármacos", "estado_cenabast": "Estado Cenabast", "estado": "Estado"},
+                     title="Estado del stock según estado Cenabast")
+        fig.update_layout(height=340, margin=dict(t=50, b=10, l=10, r=10), legend=dict(orientation="h", y=-0.25))
+        st.plotly_chart(fig)
+
+    st.subheader("Los 15 más urgentes")
+    st.caption("Fármacos en QS o CR con consumo, ordenados por consumo mensual promedio.")
+    urg = df[df["estado"].isin(["QS", "CR"]) & (df["consumo_prom"] > 0)].sort_values(
+        "consumo_prom", ascending=False).head(15)
+    st.dataframe(
+        urg[["estado_icon", "descripcion", "rotacion", "stock_sin", "consumo_dia", "aut_dias",
+             "estado_cenabast", "cen_por_llegar", "seguimiento"]],
+        hide_index=True,
+        column_config={
+            "estado_icon": "Estado", "descripcion": "Fármaco", "rotacion": "Rotación",
+            "stock_sin": st.column_config.NumberColumn("Stock sin stocklight", format="%.0f"),
+            "consumo_dia": st.column_config.NumberColumn("Consumo diario", format="%.0f"),
+            "aut_dias": st.column_config.NumberColumn("Autonomía (días)", format="%.1f"),
+            "estado_cenabast": "Cenabast",
+            "cen_por_llegar": st.column_config.NumberColumn("Entrega Cenabast", format="%.0f"),
+            "seguimiento": "Seguimiento",
+        })
+
+    st.subheader("Listado completo")
+    est_sel = st.multiselect("Estados a mostrar", ESTADOS, default=ESTADOS, key="est_tab1")
+    lst = df[df["estado"].isin(est_sel)].copy()
+    lst["orden"] = lst["estado"].map({e: i for i, e in enumerate(ESTADOS)})
+    lst = lst.sort_values(["orden", "aut_dias"])
+    vista = lst[["estado_icon", "codigo", "descripcion", "rotacion", "stock_sin", "stock_total",
+                 "consumo_prom", "consumo_dia", "aut_dias", "estado_cenabast", "convenio",
+                 "conv_vcto_dias", "seguimiento"]]
+    st.dataframe(
+        vista, hide_index=True,
+        column_config={
+            "estado_icon": "Estado", "codigo": "Código", "descripcion": "Fármaco", "rotacion": "Rotación",
+            "stock_sin": st.column_config.NumberColumn("Stock sin stocklight", format="%.0f"),
+            "stock_total": st.column_config.NumberColumn("Stock total", format="%.0f"),
+            "consumo_prom": st.column_config.NumberColumn("Consumo mensual prom.", format="%.0f"),
+            "consumo_dia": st.column_config.NumberColumn("Consumo diario", format="%.0f"),
+            "aut_dias": st.column_config.NumberColumn("Autonomía (días)", format="%.1f"),
+            "estado_cenabast": "Cenabast", "convenio": "Convenio",
+            "conv_vcto_dias": st.column_config.NumberColumn("Convenio vence en (días)", format="%.0f"),
+            "seguimiento": "Seguimiento",
+        })
+    st.download_button("Descargar listado (CSV)", vista.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="estado_farmacos.csv", mime="text/csv")
+
+with tab2:
+    orden_sel = df.assign(o=df["estado"].map({e: i for i, e in enumerate(ESTADOS)})).sort_values(
+        ["o", "consumo_prom"], ascending=[True, False])
+    opciones = list(orden_sel.index)
+    idx = st.selectbox("Fármaco", opciones,
+                       format_func=lambda i: f"{ESTADO_ICON[b.at[i, 'estado']]}  {b.at[i, 'descripcion']}",
+                       help="Escribe para buscar. Primero aparecen los QS y críticos con más consumo.")
+    r = b.loc[idx]
+    e = r["estado"]
+
+    k = st.columns(5)
+    with k[0]:
+        kpi("Estado", ESTADO_TXT[e], f"Rotación {r['rotacion']}", ESTADO_COLOR[e])
+    with k[1]:
+        kpi("Autonomía actual", f"{r['aut_dias']:.0f} días", f"Stock sin stocklight: {n0(r['stock_sin'])}")
+    with k[2]:
+        kpi("Consumo diario", n0(r["consumo_dia"]), f"Mensual promedio: {n0(r['consumo_prom'])}")
+    with k[3]:
+        qd = r["quiebre_dias"]
+        if not np.isfinite(qd):
+            kpi("Quiebre proyectado", "Sin quiebre", "En los próximos 2 años")
+        else:
+            kpi("Quiebre proyectado", f"{r['quiebre_fecha']:%d/%m/%Y}", f"En {qd:.0f} días")
+    with k[4]:
+        kpi("Compra sugerida", n0(r["compra"]), f"Para {horiz_m} meses | {clp(r['compra_valor'])}")
+
+    st.subheader("Consumo mensual: real y proyectado")
+    hist_x = [mes_ts(m) for m in months]
+    nfc = st.slider("Meses a proyectar en el gráfico", 1, HORIZONTE_FC, 6, key="nfc_ficha")
+    fx = [mes_ts(m) for m in fc_months[:nfc]]
+    fy = F[idx, :nfc] * days_fc[:nfc]
+    flo = np.clip(F[idx, :nfc] - Z80 * SIG[idx, :nfc], 0, None) * days_fc[:nfc]
+    fhi = (F[idx, :nfc] + Z80 * SIG[idx, :nfc]) * days_fc[:nfc]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=fx + fx[::-1], y=list(fhi) + list(flo[::-1]), fill="toself",
+                             fillcolor="rgba(59,110,168,0.18)", line=dict(width=0),
+                             name="Rango probable (80 %)", hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=hist_x, y=Y[idx], mode="lines+markers", name="Consumo real",
+                             line=dict(color="#2E7D5B", width=3)))
+    fig.add_trace(go.Scatter(x=[hist_x[-1]] + fx, y=[Y[idx][-1]] + list(fy), mode="lines+markers",
+                             name="Proyección", line=dict(color="#3B6EA8", width=3, dash="dash")))
+    prog_x, prog_y = [], []
+    for ym_ in list(months) + fc_months:
+        cname = f"PROG {mes_label(ym_)}"
+        if cname in ars.columns:
+            v = ars.at[idx, cname]
+            if pd.notna(v) and v > 0:
+                prog_x.append(mes_ts(ym_))
+                prog_y.append(v)
+    if prog_x:
+        fig.add_trace(go.Scatter(x=prog_x, y=prog_y, mode="markers", name="Programado",
+                                 marker=dict(symbol="diamond", size=11, color="#E8890C")))
+    fig.update_layout(height=400, margin=dict(t=20, b=10, l=10, r=10), yaxis_title="Unidades por mes",
+                      legend=dict(orientation="h", y=-0.15), hovermode="x unified")
+    st.plotly_chart(fig)
+    st.caption(f"Modelo elegido: {r['modelo']}   |   Confianza: {r['confianza']}"
+               + (f"   |   Error histórico del modelo (WAPE): {r['wape']:.0%}" if pd.notna(r["wape"]) else ""))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Stock por ubicación")
+        ubic = {
+            "Farmacia AT abierta": "STOCK AT ABIERTA", "Farmacia AT cerrada": "STOCK AT CERRADA",
+            "Stocklight abierta": "STOCKLIGTH ABIERTA", "Stocklight cerrada": "STOCKTIGTH CERADA",
+            "Botiquín urgencia": "BOTIQUIN URGENCIA", "Bodega CEM": "BODEGA CEM",
+            "Bodega fármacos": "FARMACOS", "Bodega fármacos 2": "FARMACOS 2",
+        }
+        ud = pd.DataFrame({"Ubicación": [k_ for k_, v in ubic.items() if v in ars.columns],
+                           "Unidades": [ars.at[idx, v] for v in ubic.values() if v in ars.columns]})
+        ud["Unidades"] = pd.to_numeric(ud["Unidades"], errors="coerce").fillna(0)
+        fig = px.bar(ud, x="Unidades", y="Ubicación", orientation="h", color_discrete_sequence=["#3B6EA8"])
+        fig.update_layout(height=330, margin=dict(t=10, b=10, l=10, r=10), yaxis=dict(autorange="reversed"))
+        st.plotly_chart(fig)
+    with c2:
+        st.subheader("Qué modelo acierta más")
+        wm = fc["wape_m"][idx]
+        if np.all(np.isnan(wm)):
+            st.info("No hay consumo suficiente para evaluar modelos.")
+        else:
+            md = pd.DataFrame({"Modelo": MODEL_NAMES, "Error (WAPE)": wm})
+            md["Elegido"] = np.where(md["Modelo"] == r["modelo"], "Sí", "")
+            fig = px.bar(md, x="Error (WAPE)", y="Modelo", orientation="h", color="Elegido",
+                         color_discrete_map={"Sí": "#3B6EA8", "": "#B5B5B5"})
+            fig.update_layout(height=330, margin=dict(t=10, b=10, l=10, r=10), showlegend=False,
+                              yaxis=dict(autorange="reversed"), xaxis_tickformat=".0%")
+            st.plotly_chart(fig)
+            st.caption("Cada modelo intentó adivinar los últimos meses con datos anteriores. Menor error es mejor.")
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.markdown("**Cenabast**")
+        st.write(f"Estado: {r['estado_cenabast']}")
+        st.write(f"Programado: {n0(r['cen_prog'])}")
+        st.write(f"Entrega aprobada: {n0(r['cen_ent'])}")
+        st.write(f"Faltante: {n0(r['cen_falt'])}")
+    with d2:
+        st.markdown("**Convenio**")
+        if pd.isna(r["convenio"]):
+            st.write("Sin convenio vigente")
+        else:
+            st.write(f"Licitación: {r['convenio']}")
+            st.write(f"Saldo: {n0(r['conv_saldo'])}")
+            vct = "sin fecha" if pd.isna(r["conv_vcto"]) else f"{r['conv_vcto']:%d/%m/%Y} ({n0(r['conv_vcto_dias'])} días)"
+            st.write(f"Vence: {vct}")
+    with d3:
+        st.markdown("**Seguimiento**")
+        st.write(r["seguimiento"] if pd.notna(r["seguimiento"]) and str(r["seguimiento"]).strip() else "Sin comentarios")
+        st.write(f"Precio unitario estimado: {clp(r['precio'])}")
+
+with tab3:
+    st.caption(
+        f"Compra sugerida = demanda proyectada de {horiz_m} meses + {dias_seg} días de seguridad "
+        f"- stock ({'sin stocklight' if base_stock.startswith('Sin') else 'total'})"
+        + (" - entregas Cenabast por llegar" if desc_cen else "")
+        + ". Los parámetros se cambian en la barra lateral."
+    )
+    horiz_q = st.slider("Alertar quiebres dentro de (días)", 7, 180, 30, key="q_dias_t3")
+    con_compra = df[df["compra"] > 0]
+    quiebres = df[(df["quiebre_dias"] <= horiz_q) & (df["estado"] != "QS")]
+    k = st.columns(4)
+    with k[0]:
+        kpi("Fármacos con compra sugerida", n0(len(con_compra)), f"de {n0(len(df))}", "#3B6EA8")
+    with k[1]:
+        kpi("Valor estimado de la compra", clp(con_compra["compra_valor"].sum()),
+            "Solo fármacos con precio conocido", "#3B6EA8")
+    with k[2]:
+        kpi(f"Quiebres en {horiz_q} días", n0(len(quiebres)), "Sin contar los que ya están en QS", "#E8890C")
+    with k[3]:
+        sub = df[df["senal_prog"].isin(["Subprogramado", "Sin programación"])]
+        kpi(f"Subprogramados en {mes_label(m1)}", n0(len(sub)), "Programación menor a la demanda proyectada", "#B3261E")
+
+    st.subheader("Demanda total valorizada")
+    dv = df[df["precio"].notna()]
+    ii = dv.index.to_numpy()
+    pr = dv["precio"].to_numpy(float)
+    hist_val = (Y[ii] * pr[:, None]).sum(axis=0)
+    nf = st.slider("Meses a proyectar", 1, HORIZONTE_FC, 6, key="nfc_total")
+    fc_val = (F[ii, :nf] * days_fc[:nf] * pr[:, None]).sum(axis=0)
+    sig_val = np.sqrt((((SIG[ii, :nf] * days_fc[:nf]) * pr[:, None]) ** 2).sum(axis=0))
+    fx = [mes_ts(m) for m in fc_months[:nf]]
+    hx = [mes_ts(m) for m in months]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=fx + fx[::-1], y=list(fc_val + Z80 * sig_val) + list(np.clip(fc_val - Z80 * sig_val, 0, None)[::-1]),
+                             fill="toself", fillcolor="rgba(59,110,168,0.18)", line=dict(width=0),
+                             name="Rango probable (80 %)", hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=hx, y=hist_val, mode="lines+markers", name="Consumo real",
+                             line=dict(color="#2E7D5B", width=3)))
+    fig.add_trace(go.Scatter(x=[hx[-1]] + fx, y=[hist_val[-1]] + list(fc_val), mode="lines+markers",
+                             name="Proyección", line=dict(color="#3B6EA8", width=3, dash="dash")))
+    fig.update_layout(height=380, margin=dict(t=20, b=10, l=10, r=10), yaxis_title="Pesos por mes",
+                      legend=dict(orientation="h", y=-0.15), hovermode="x unified")
+    st.plotly_chart(fig)
+    st.caption("Consumo multiplicado por el precio unitario estimado desde STOCK CENTRALIZADO. "
+               f"Cubre {n0(len(dv))} de {n0(len(df))} fármacos (los demás no tienen precio).")
+
+    top = df.assign(valor_h=df["demanda_h"] * df["precio"]).sort_values("valor_h", ascending=False).head(15)
+    fig = px.bar(top, x="valor_h", y="descripcion", orientation="h", color="estado",
+                 color_discrete_map=ESTADO_COLOR, category_orders={"estado": ESTADOS},
+                 labels={"valor_h": f"Demanda proyectada {horiz_m} meses ($)", "descripcion": "", "estado": "Estado"},
+                 title=f"Los 15 fármacos con mayor demanda valorizada en los próximos {horiz_m} meses")
+    fig.update_layout(height=470, margin=dict(t=50, b=10, l=10, r=10), yaxis=dict(autorange="reversed"),
+                      legend=dict(orientation="h", y=-0.12))
+    st.plotly_chart(fig)
+
+    st.subheader("Compra sugerida y programación")
+    solo_compra = st.checkbox("Mostrar solo fármacos con compra sugerida", value=True)
+    señales = ["Subprogramado", "Sin programación", "Alineado", "Sobreprogramado", "Sin demanda", "Sin dato"]
+    sel_sen = st.multiselect(f"Programación {mes_label(m1)}", señales, default=señales)
+    tb = df[df["senal_prog"].isin(sel_sen)]
+    if solo_compra:
+        tb = tb[tb["compra"] > 0]
+    tb = tb.sort_values("compra_valor", ascending=False, na_position="last")
+    vista3 = tb[["estado_icon", "descripcion", "stock_base", "cen_por_llegar", "demanda_h", "compra",
+                 "compra_valor", "proy_mes1", "prog_mes1", "senal_prog", "quiebre_dias", "modelo", "confianza"]]
+    st.dataframe(
+        vista3, hide_index=True,
+        column_config={
+            "estado_icon": "Estado", "descripcion": "Fármaco",
+            "stock_base": st.column_config.NumberColumn("Stock considerado", format="%.0f"),
+            "cen_por_llegar": st.column_config.NumberColumn("Cenabast por llegar", format="%.0f"),
+            "demanda_h": st.column_config.NumberColumn(f"Demanda {horiz_m} meses", format="%.0f"),
+            "compra": st.column_config.NumberColumn("Compra sugerida", format="%.0f"),
+            "compra_valor": st.column_config.NumberColumn("Valor compra ($)", format="%.0f"),
+            "proy_mes1": st.column_config.NumberColumn(f"Proyectado {mes_label(m1)}", format="%.0f"),
+            "prog_mes1": st.column_config.NumberColumn(f"Programado {mes_label(m1)}", format="%.0f"),
+            "senal_prog": "Programación",
+            "quiebre_dias": st.column_config.NumberColumn("Días a quiebre", format="%.0f"),
+            "modelo": "Modelo", "confianza": "Confianza",
+        })
+    st.download_button("Descargar compras sugeridas (CSV)", vista3.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="compras_sugeridas.csv", mime="text/csv")
+
+    with st.expander("Cómo se calcula la proyección", expanded=False):
+        st.markdown(
+            "- El consumo mensual se pasa a **consumo diario** (dividiendo por los días de cada mes) para que "
+            "febrero no parezca una baja.\n"
+            "- Para cada fármaco se prueban 5 modelos simples: promedio de 3 meses, promedio histórico, "
+            "suavizamiento exponencial, Holt amortiguado y tendencia lineal.\n"
+            "- Cada modelo intenta adivinar mes a mes los últimos meses usando solo los anteriores. "
+            "Se elige el de menor error (WAPE) y ese error define el **rango probable del 80 %**.\n"
+            "- El **quiebre proyectado** recorre día a día la demanda proyectada hasta agotar el stock disponible."
+        )
+
+with tab4:
+    st.subheader("Quiebres próximos")
+    ya_qs = df[(df["estado"] == "QS") & (df["tasa_fc_dia"] > 0)]
+    umbral_q = st.slider("Mostrar fármacos que se quedan sin stock en menos de (días)", 7, 180, 30, key="q_dias_t4")
+    pq = df[(df["quiebre_dias"] <= umbral_q) & (df["estado"] != "QS")].sort_values("quiebre_dias")
+    a1, a2 = st.columns(2)
+    with a1:
+        kpi("Se quedan sin stock pronto", n0(len(pq)), f"En menos de {umbral_q} días", "#E8890C")
+    with a2:
+        kpi("Ya en QS pero con demanda proyectada", n0(len(ya_qs)), "Hay que reponer", "#B3261E")
+    st.dataframe(
+        pq[["estado_icon", "descripcion", "stock_base", "cen_por_llegar", "tasa_fc_dia", "quiebre_dias",
+            "quiebre_fecha", "estado_cenabast", "compra"]],
+        hide_index=True,
+        column_config={
+            "estado_icon": "Estado", "descripcion": "Fármaco",
+            "stock_base": st.column_config.NumberColumn("Stock considerado", format="%.0f"),
+            "cen_por_llegar": st.column_config.NumberColumn("Cenabast por llegar", format="%.0f"),
+            "tasa_fc_dia": st.column_config.NumberColumn("Demanda diaria proyectada", format="%.0f"),
+            "quiebre_dias": st.column_config.NumberColumn("Días a quiebre", format="%.0f"),
+            "quiebre_fecha": st.column_config.DateColumn("Fecha de quiebre", format="DD/MM/YYYY"),
+            "estado_cenabast": "Cenabast",
+            "compra": st.column_config.NumberColumn("Compra sugerida", format="%.0f"),
+        })
+    with st.expander("Fármacos ya en QS con demanda proyectada"):
+        st.dataframe(
+            ya_qs.sort_values("tasa_fc_dia", ascending=False)[
+                ["descripcion", "rotacion", "tasa_fc_dia", "estado_cenabast", "cen_por_llegar", "compra", "seguimiento"]],
+            hide_index=True,
+            column_config={
+                "descripcion": "Fármaco", "rotacion": "Rotación",
+                "tasa_fc_dia": st.column_config.NumberColumn("Demanda diaria proyectada", format="%.1f"),
+                "estado_cenabast": "Cenabast",
+                "cen_por_llegar": st.column_config.NumberColumn("Cenabast por llegar", format="%.0f"),
+                "compra": st.column_config.NumberColumn("Compra sugerida", format="%.0f"),
+                "seguimiento": "Seguimiento"})
+
+    st.subheader("Cenabast con problemas y stock bajo")
+    riesgo = df[df["estado_cenabast"].isin(CEN_RIESGO)]
+    cz = riesgo[riesgo["estado"].isin(["QS", "CR"])].sort_values("consumo_prom", ascending=False)
+    b1, b2 = st.columns([1, 2])
+    with b1:
+        kpi("Cenabast FALTANTE, SUSPENDIDO o ELIMINADO", n0(len(riesgo)), f"{n0(len(cz))} están en QS o CR", "#B3261E")
+        if len(riesgo):
+            mt = pd.crosstab(riesgo["estado_cenabast"], riesgo["estado"]).reindex(columns=ESTADOS).fillna(0).astype(int)
+            st.dataframe(mt)
+    with b2:
+        st.dataframe(
+            cz[["estado_icon", "descripcion", "estado_cenabast", "cen_prog", "cen_falt", "stock_sin",
+                "aut_dias", "consumo_prom"]],
+            hide_index=True,
+            column_config={
+                "estado_icon": "Estado", "descripcion": "Fármaco", "estado_cenabast": "Cenabast",
+                "cen_prog": st.column_config.NumberColumn("Programado", format="%.0f"),
+                "cen_falt": st.column_config.NumberColumn("Faltante", format="%.0f"),
+                "stock_sin": st.column_config.NumberColumn("Stock sin stocklight", format="%.0f"),
+                "aut_dias": st.column_config.NumberColumn("Autonomía (días)", format="%.1f"),
+                "consumo_prom": st.column_config.NumberColumn("Consumo mensual prom.", format="%.0f")})
+
+    st.subheader("Sobre stock y dinero inmovilizado")
+    ss = df[df["estado"] == "SS"].copy()
+    ss["exceso_u"] = np.clip(ss["stock_sin"] - ss["stock_ideal"], 0, None)
+    ss["exceso_val"] = ss["exceso_u"] * ss["precio"]
+    ss["stock_val"] = ss["stock_sin"] * ss["precio"]
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        kpi("Fármacos en sobre stock", n0(len(ss)), f"Autonomía de {u_ss} días o más", ESTADO_COLOR["SS"])
+    with c2:
+        kpi("Valor del stock en SS", clp(ss["stock_val"].sum()), "Stock sin stocklight por precio", ESTADO_COLOR["SS"])
+    with c3:
+        kpi("Exceso sobre el stock ideal", clp(ss["exceso_val"].sum()), "Stock ideal = 60 días de consumo", ESTADO_COLOR["SS"])
+    top_ss = ss.sort_values("exceso_val", ascending=False).head(15)
+    fig = px.bar(top_ss, x="exceso_val", y="descripcion", orientation="h",
+                 color_discrete_sequence=[ESTADO_COLOR["SS"]],
+                 labels={"exceso_val": "Exceso valorizado ($)", "descripcion": ""},
+                 title="Los 15 con mayor exceso valorizado")
+    fig.update_layout(height=450, margin=dict(t=50, b=10, l=10, r=10), yaxis=dict(autorange="reversed"))
+    st.plotly_chart(fig)
+    st.dataframe(
+        ss.sort_values("exceso_val", ascending=False)[
+            ["descripcion", "rotacion", "stock_sin", "stock_ideal", "aut_dias", "exceso_u", "exceso_val"]],
+        hide_index=True,
+        column_config={
+            "descripcion": "Fármaco", "rotacion": "Rotación",
+            "stock_sin": st.column_config.NumberColumn("Stock sin stocklight", format="%.0f"),
+            "stock_ideal": st.column_config.NumberColumn("Stock ideal", format="%.0f"),
+            "aut_dias": st.column_config.NumberColumn("Autonomía (días)", format="%.0f"),
+            "exceso_u": st.column_config.NumberColumn("Exceso (unidades)", format="%.0f"),
+            "exceso_val": st.column_config.NumberColumn("Exceso ($)", format="%.0f")})
+
+    st.subheader("Convenios por vencer o con poco saldo")
+    u_conv = st.slider("Alertar convenios que vencen en menos de (días)", 30, 365, 180, key="u_conv")
+    u_cob = st.slider("Alertar saldo que cubre menos de (meses)", 1, 12, 3, key="u_cob")
+    cv_df = df[df["convenio"].notna()].copy()
+    cv_df["cob_meses"] = np.where(cv_df["tasa_fc_dia"] > 0,
+                                  cv_df["conv_saldo"] / (cv_df["tasa_fc_dia"] * 30.4375), np.inf)
+    al = cv_df[(cv_df["conv_vcto_dias"] < u_conv) | (cv_df["cob_meses"] < u_cob)].sort_values("conv_vcto_dias")
+    sin_conv_riesgo = df[df["convenio"].isna() & df["estado"].isin(["QS", "CR"]) & (df["consumo_prom"] > 0)]
+    d1, d2 = st.columns(2)
+    with d1:
+        kpi("Convenios en alerta", n0(len(al)), f"De {n0(len(cv_df))} fármacos con convenio", "#E8890C")
+    with d2:
+        kpi("QS o CR sin convenio vigente", n0(len(sin_conv_riesgo)), "Dependen de compra directa o Cenabast", "#B3261E")
+    st.dataframe(
+        al[["estado_icon", "descripcion", "convenio", "conv_saldo", "cob_meses", "conv_vcto", "conv_vcto_dias"]],
+        hide_index=True,
+        column_config={
+            "estado_icon": "Estado", "descripcion": "Fármaco", "convenio": "Licitación",
+            "conv_saldo": st.column_config.NumberColumn("Saldo", format="%.0f"),
+            "cob_meses": st.column_config.NumberColumn("Cobertura del saldo (meses)", format="%.1f"),
+            "conv_vcto": st.column_config.DateColumn("Vence", format="DD/MM/YYYY"),
+            "conv_vcto_dias": st.column_config.NumberColumn("Días al vencimiento", format="%.0f")})
+
+    st.subheader("Lotes por vencer")
+    if venc.empty:
+        st.info("La hoja VENCIMIENTOS no tiene lotes.")
+    else:
+        v = venc.copy()
+        v["dias"] = (v["Fecha Vencimiento"] - fecha_stock_ts).dt.days
+        tasa = b.set_index("codigo")["tasa_fc_dia"]
+        v["tasa"] = v["Código"].map(tasa).fillna(0)
+        v["consumible"] = v["tasa"] * v["dias"].clip(lower=0)
+        v["en_riesgo"] = np.ceil(np.clip(v["Cantidad"] - v["consumible"], 0, None))
+        v["valor_riesgo"] = v["en_riesgo"] * v["Precio Lote"]
+        v["situacion"] = np.where(v["dias"] < 0, "Vencido",
+                                  np.where(v["en_riesgo"] > 0, "En riesgo de pérdida", "Se alcanza a consumir"))
+        e1, e2, e3 = st.columns(3)
+        with e1:
+            kpi("Lotes listados", n0(len(v)), "Hoja VENCIMIENTOS", "#E8890C")
+        with e2:
+            kpi("Lotes en riesgo de pérdida", n0((v["situacion"] != "Se alcanza a consumir").sum()),
+                "Vencidos o que no alcanzan a consumirse", "#B3261E")
+        with e3:
+            kpi("Valor en riesgo", clp(v["valor_riesgo"].sum()), "Unidades que no se consumirían a tiempo", "#B3261E")
+        st.dataframe(
+            v.sort_values("dias")[["Bodega", "Producto", "Lote", "Fecha Vencimiento", "dias", "Cantidad",
+                                   "consumible", "en_riesgo", "valor_riesgo", "situacion"]],
+            hide_index=True,
+            column_config={
+                "Fecha Vencimiento": st.column_config.DateColumn("Vence", format="DD/MM/YYYY"),
+                "dias": st.column_config.NumberColumn("Días restantes", format="%.0f"),
+                "consumible": st.column_config.NumberColumn("Se consumiría", format="%.0f"),
+                "en_riesgo": st.column_config.NumberColumn("En riesgo (unidades)", format="%.0f"),
+                "valor_riesgo": st.column_config.NumberColumn("Valor en riesgo ($)", format="%.0f"),
+                "situacion": "Situación"})
+
+    st.subheader("Vencimientos de los fármacos de mayor demanda")
+    if archivos["vencimientos"] is None:
+        st.info("Sube el reporte de stock por lote («Reporte de Stock… productos que vencen en los próximos N días») "
+                "para ver qué fármacos de mayor demanda están por vencer.")
+    else:
+        try:
+            vl_f, meta_vf = load_vencimientos(archivos["vencimientos"][1])
+        except Exception as exc:
+            st.error(f"No pude leer el reporte de vencimientos: {exc}")
+        else:
+            ref_vf = pd.Timestamp(meta_vf["fecha"] or date.today())
+            lots_f = riesgo_fefo(vl_f[vl_f["codigo"].isin(set(b["codigo"]))],
+                                 b.set_index("codigo")["tasa_fc_dia"], ref_vf)
+            render_venc_top(lots_f, meta_vf, df.rename(columns={"descripcion": "producto"}),
+                            "farm", "fármacos", ref_vf)
+
+with tab5:
+    render_insumos(archivos["stock_insumos"], archivos["salidas_insumos"], data["licit"],
+                   u_cr, u_ss, horiz_m, dias_seg, archivos["vencimientos"])
